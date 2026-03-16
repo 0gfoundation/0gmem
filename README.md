@@ -42,26 +42,66 @@ Most AI memory systems treat memories as flat text chunks in a vector store — 
 
 ## Key Innovations
 
-0GMem addresses the fundamental limitations of existing memory systems through:
+### 1. Structure at Write Time
+Every message is decomposed at ingestion — not deferred to retrieval:
+- **Entity & relation extraction** with negation detection
+- **Temporal anchoring** via Allen's interval algebra (13 relations)
+- **Speaker-enriched embeddings**: `[Speaker] (date): content` gives the embedding model speaker and temporal signal
+- **LLM topic segmentation**: Every 100 messages, an LLM segments the conversation into topic chunks with extracted entities, relations, causal links, and facts
+- **Cross-person trait synthesis**: Detects shared attributes across speakers (e.g., "both Alice and Bob are engineers")
 
-### 1. Unified Memory Graph (UMG)
-Four orthogonal graph views for comprehensive memory representation:
-- **Temporal Graph**: Allen's interval algebra for precise temporal reasoning
+### 2. Four Orthogonal Memory Graphs
+A single `UnifiedMemoryGraph` combines four views that can be traversed simultaneously:
+- **Temporal Graph**: Allen's interval algebra for precise time relationships (BEFORE, AFTER, DURING, OVERLAPS, etc.)
 - **Semantic Graph**: Embedding-based similarity with concept relationships
-- **Causal Graph**: Cause-effect tracking for "why" questions
-- **Entity Graph**: Entity relationships with **negative relation support**
+- **Causal Graph**: Cause-effect chains for "why" and "what happened because of" questions
+- **Entity Graph**: Entity relationships with **first-class negation support** ("Alice does NOT like sushi")
 
-### 2. Memory Hierarchy
-Inspired by cognitive science:
-- **Working Memory**: Active reasoning workspace with attention-based decay
-- **Episodic Memory**: Personal history with lossless compression
-- **Semantic Memory**: Accumulated facts with confidence and contradiction tracking
+### 3. Cognitive-Science Memory Hierarchy
+- **Working Memory**: Attention-decayed scratchpad that prioritizes recent context
+- **Episodic Memory**: Lossless per-message storage across sessions
+- **Semantic Memory**: Accumulated facts with confidence scores and contradiction tracking
+- **Topic Chunks**: LLM-segmented message groups that enable cross-message inference
 
-### 3. Advanced Retrieval
-- **Multi-hop graph traversal** for complex reasoning
-- **Temporal chain reasoning** for time-based questions
-- **Position-aware composition** to combat "lost-in-the-middle"
-- **Negation checking** for adversarial robustness
+### 4. 8-Strategy Retrieval with RRF Fusion
+Instead of single-vector similarity, 0GMem fuses 8 retrieval strategies via Reciprocal Rank Fusion:
+
+| # | Strategy | What it captures |
+|---|----------|-----------------|
+| 1 | Semantic search | Embedding similarity |
+| 2 | Entity graph lookup | Direct entity relationships |
+| 3 | Temporal search | Time-based reasoning via Allen's intervals |
+| 4 | Graph traversal | Multi-hop BFS across entity + causal graphs |
+| 5 | Fact search | Semantic memory triple lookup |
+| 6 | Working memory | Attention-weighted recent context |
+| 7 | BM25 sparse search | Keyword matching for exact terms |
+| 8 | Hierarchical search | Session → Chunk → Message tree traversal |
+
+Strategy weights dynamically adjust based on query type — temporal questions boost temporal search weight, multi-hop questions boost graph traversal and hierarchical search.
+
+### 5. Agentic Retrieval Loop
+Multi-round retrieval with sufficiency checking:
+1. **Round 1**: Retrieve with original query, check if context is sufficient
+2. **Round 2+**: If insufficient, rewrite the query using 5 strategies (gap-filling, synonym expansion, temporal context, multi-person injection, LLM rewrite) and retrieve again
+3. Results are deduplicated, re-ranked, and merged across rounds
+
+### 6. Attention Filter (Precise Forgetting)
+The single biggest accuracy driver (+5% on 10-conv). Before the LLM sees any context:
+1. Score each result for relevance (query overlap, entity presence, source type)
+2. Remove low-relevance noise (threshold-based)
+3. Deduplicate semantically similar results (>85% similarity)
+4. Enforce topic diversity
+5. Apply token budget
+
+Over-retrieval actively hurts accuracy — this filter ensures the LLM only sees what matters.
+
+### 7. Question-Type-Aware Reasoning
+Queries are classified into 9 types, each with specialized prompts and pipelines:
+- **YES_NO, FACTUAL, CHOICE**: Direct answer extraction
+- **TEMPORAL_DATE, TEMPORAL_DURATION**: Event-date resolution with temporal graph
+- **COUNTING**: 3-tier pipeline (regex → LLM counting with Jaccard-deduplicated evidence → date-based enumeration)
+- **MULTI_HOP**: Query decomposition + cross-session graph traversal
+- **ADVERSARIAL**: Negation verification against entity graph
 
 ## Installation
 
@@ -212,36 +252,81 @@ python scripts/run_evaluation.py --data-path data/locomo/sample_locomo.json --us
 
 ## Architecture
 
-```
-0GMem Architecture
-==================
+### Write Path (Ingestion)
 
-┌─────────────────────────────────────────────────────────────────┐
-│                         0GMem System                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │ Encoder  │───▶│ Memory   │───▶│Consolidate│───▶│ Retriever│  │
-│  │ Layer    │    │ Manager  │    │  Layer   │    │  Layer   │  │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
-│       │               │               │               │         │
-│       ▼               ▼               ▼               ▼         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                 Unified Memory Graph                     │   │
-│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐        │   │
-│  │  │Temporal│  │Semantic│  │ Causal │  │ Entity │        │   │
-│  │  │ Graph  │  │ Graph  │  │ Graph  │  │ Graph  │        │   │
-│  │  └────────┘  └────────┘  └────────┘  └────────┘        │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   Memory Hierarchy                       │   │
-│  │  ┌─────────┐   ┌─────────┐   ┌─────────┐               │   │
-│  │  │ Working │   │Episodic │   │Semantic │               │   │
-│  │  │ Memory  │   │ Memory  │   │ Memory  │               │   │
-│  │  └─────────┘   └─────────┘   └─────────┘               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+```
+Message ──▶ Encoder ──▶ Memory Manager ──▶ Unified Memory Graph
+              │              │
+              ▼              ▼
+         ┌─────────┐  ┌──────────┐
+         │ Entity  │  │ Chunker  │ ◀── LLM topic segmentation
+         │ Temporal│  │ (100 msg │     every 100 messages
+         │Negation │  │ windows) │
+         │ Facts   │  └──────────┘
+         └─────────┘       │
+              │            ▼
+              ▼      ┌──────────────┐
+         ┌─────────┐ │ Consolidator │ ◀── Cross-person trait
+         │ BM25 +  │ │ (Facts,      │     synthesis, fact
+         │ Vector  │ │  Profiles)   │     extraction
+         │ Index   │ └──────────────┘
+         └─────────┘
+```
+
+### Read Path (Retrieval)
+
+```
+Query ──▶ Query Analyzer ──▶ 8-Strategy Retrieval ──▶ RRF Fusion
+            │                    │
+            ▼                    ▼
+       ┌──────────┐     ┌──────────────────┐
+       │ Intent   │     │ 1. Semantic      │
+       │ Entity   │     │ 2. Entity graph  │
+       │ Temporal │     │ 3. Temporal      │
+       │ Reasoning│     │ 4. Graph BFS     │
+       │ Type     │     │ 5. Fact search   │
+       └──────────┘     │ 6. Working mem   │
+                        │ 7. BM25          │
+                        │ 8. Hierarchical  │
+                        └──────────────────┘
+                                │
+                                ▼
+RRF Fusion ──▶ Entity Scoring ──▶ LLM Reranking ──▶ Attention Filter
+                                                         │
+                                                         ▼
+                                          ┌─────────────────────────┐
+                                          │ Precise Forgetting:     │
+                                          │ • Relevance threshold   │
+                                          │ • Semantic dedup (>85%) │
+                                          │ • Diversity enforcement │
+                                          │ • Token budgeting       │
+                                          └──────────┬──────────────┘
+                                                     ▼
+                              Agentic Loop ◀── Sufficient? ──▶ Answer Generator
+                              (rewrite query,       No              │ Yes
+                               retrieve again)                      ▼
+                                                         Question-Type-Aware
+                                                         Prompt + LLM Answer
+```
+
+### Storage Layer
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                   Unified Memory Graph                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ Temporal  │  │ Semantic │  │  Causal  │  │  Entity  │  │
+│  │ (Allen's  │  │(Embedding│  │ (Cause → │  │(Relations│  │
+│  │ Intervals)│  │Similarity│  │  Effect) │  │+Negation)│  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+├───────────────────────────────────────────────────────────┤
+│                    Memory Hierarchy                        │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌────────┐ │
+│  │ Working  │   │ Episodic │   │ Semantic │   │ Topic  │ │
+│  │ (Decayed │   │(Lossless │   │ (Facts + │   │ Chunks │ │
+│  │  Recent) │   │ Messages)│   │Confidence│   │(100msg)│ │
+│  └──────────┘   └──────────┘   └──────────┘   └────────┘ │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Performance
@@ -278,42 +363,76 @@ The [LoCoMo benchmark](https://snap-research.github.io/locomo/) evaluates long-t
 ```
 0gmem/
 ├── src/zerogmem/
-│   ├── graph/              # Unified Memory Graph
-│   │   ├── temporal.py     # Temporal reasoning
-│   │   ├── semantic.py     # Semantic similarity
-│   │   ├── causal.py       # Causal reasoning
-│   │   ├── entity.py       # Entity relationships
-│   │   └── unified.py      # Combined graph
-│   ├── memory/             # Memory hierarchy
-│   │   ├── working.py      # Working memory
-│   │   ├── episodic.py     # Episodic memory
-│   │   ├── semantic.py     # Semantic facts
-│   │   └── manager.py      # Memory orchestration
-│   ├── encoder/            # Memory encoding
-│   │   ├── encoder.py      # Main encoder
-│   │   ├── entity_extractor.py
-│   │   └── temporal_extractor.py
-│   ├── retriever/          # Memory retrieval
-│   │   ├── retriever.py    # Main retriever
-│   │   └── query_analyzer.py
-│   └── evaluation/         # Benchmarking
-│       └── locomo.py       # LoCoMo evaluator
-├── examples/               # Usage examples
-├── tests/                  # Test suite
-├── docs/                   # Documentation
-└── scripts/                # Utility scripts
+│   ├── defaults.py              # Centralized model config & shared constants
+│   ├── persistence.py           # State serialization/deserialization
+│   ├── mcp_server.py            # MCP server for Claude Code / OpenClaw
+│   ├── graph/                   # Unified Memory Graph
+│   │   ├── temporal.py          # Allen's interval algebra
+│   │   ├── semantic.py          # Embedding-based similarity
+│   │   ├── causal.py            # Cause-effect tracking
+│   │   ├── entity.py            # Entity relationships & negations
+│   │   └── unified.py           # Combined multi-graph
+│   ├── memory/                  # Memory hierarchy
+│   │   ├── manager.py           # Central orchestrator
+│   │   ├── working.py           # Attention-decayed working memory
+│   │   ├── episodic.py          # Lossless episode storage
+│   │   ├── semantic.py          # Accumulated facts with confidence
+│   │   ├── memcell.py           # Atomic memory units
+│   │   ├── chunker.py           # LLM-based topic segmentation
+│   │   ├── consolidator.py      # Memory consolidation & compression
+│   │   └── extractor.py         # MemCell/MemScene extraction
+│   ├── encoder/                 # Memory encoding pipeline
+│   │   ├── encoder.py           # Main encoder
+│   │   ├── embedding_cache.py   # Embedding cache with persistence
+│   │   ├── entity_extractor.py  # Named entity recognition
+│   │   ├── temporal_extractor.py # Temporal expression parsing
+│   │   ├── temporal_resolver.py # Date/time resolution
+│   │   ├── fact_extractor.py    # Rule-based fact extraction
+│   │   ├── llm_fact_extractor.py # LLM-powered profile & fact extraction
+│   │   ├── event_date_index.py  # Event-to-date mapping
+│   │   ├── entity_timeline.py   # Per-entity temporal tracking
+│   │   ├── session_summarizer.py # Session summary generation
+│   │   └── memory_types.py      # Memory type definitions
+│   ├── retriever/               # Multi-strategy retrieval
+│   │   ├── retriever.py         # Main retriever with RRF fusion
+│   │   ├── query_analyzer.py    # Intent classification & query rewriting
+│   │   ├── hierarchical_search.py # Session → Chunk → Message tree search
+│   │   ├── attention_filter.py  # Precise forgetting & noise removal
+│   │   ├── entity_scorer.py     # Entity-aware scoring
+│   │   ├── bm25_retriever.py    # BM25 keyword retrieval
+│   │   ├── multi_query.py       # Query decomposition
+│   │   ├── proposition_index.py # Proposition-level indexing
+│   │   ├── reranker.py          # LLM-based reranking
+│   │   └── semantic_profile_matcher.py # Profile-based matching
+│   ├── reasoning/               # Answer generation & verification
+│   │   ├── answer_generator.py  # LLM answer generation & normalization
+│   │   ├── answer_verifier.py   # Answer sufficiency checking
+│   │   ├── counting.py          # Counting pipeline with evidence dedup
+│   │   ├── prompt_templates.py  # Question-type-aware prompts
+│   │   └── question_decomposer.py # Compound question splitting
+│   └── evaluation/              # Benchmarking
+│       ├── locomo.py            # LoCoMo evaluator
+│       └── profile_answerer.py  # Profile-based answer generation
+├── examples/                    # Usage examples
+├── tests/                       # Test suite
+├── docs/                        # Documentation
+└── scripts/                     # Utility scripts
 ```
 
 ## Key Architectural Features
 
 | Feature | 0GMem Approach |
 |---------|----------------|
-| Temporal Reasoning | Allen's Interval Algebra for precise time relationships |
-| Graph Structure | Multi-graph with 4 orthogonal views |
-| Multi-hop Reasoning | Graph traversal (no iterative LLM calls) |
-| Negation Handling | First-class support for contradictions |
-| Memory Consolidation | Lossless compression with semantic indexing |
-| Context Composition | Position-aware to combat "lost-in-the-middle" |
+| Retrieval | 8 strategies fused via Reciprocal Rank Fusion (RRF) with query-type-adaptive weights |
+| Context Quality | Attention filter: relevance scoring → semantic dedup → diversity → token budget |
+| Temporal Reasoning | Allen's Interval Algebra (13 relations) + event-date index + bitemporal modeling |
+| Multi-hop Reasoning | Simultaneous BFS across entity, temporal, and causal graphs |
+| Entity Isolation | Graduated scoring (speaker match, first-person, secondary mention — not binary filter) |
+| Negation Handling | Extracted at ingestion, stored in entity graph, verified at retrieval |
+| Question Awareness | 9 question types with specialized prompts and answer pipelines |
+| Agentic Retrieval | Multi-round with sufficiency checking and 5 query rewriting strategies |
+| Topic Segmentation | LLM-based chunking every 100 messages with entity/causal/fact extraction |
+| Model Portability | Centralized config supporting gpt-4o-mini, gpt-4o, gpt-5.x with automatic parameter handling |
 
 ## Contributing
 
