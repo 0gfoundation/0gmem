@@ -57,6 +57,8 @@ class UnifiedMemoryItem:
     semantic_node_id: str | None = None
     causal_node_id: str | None = None
 
+    chunk_id: str | None = None  # Parent chunk reference (set by ChunkManager)
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -71,7 +73,7 @@ class UnifiedMemoryGraph:
     - Automatic graph synchronization
     """
 
-    def __init__(self, embedding_dim: int = 1536):
+    def __init__(self, embedding_dim: int = 3072):
         self.temporal_graph = TemporalGraph()
         self.semantic_graph = SemanticGraph(embedding_dim=embedding_dim)
         self.causal_graph = CausalGraph()
@@ -584,7 +586,7 @@ class UnifiedMemoryGraph:
                 semantic_node_id -> embedding for the semantic sub-graph).
         """
         embeddings_map = embeddings_map or {}
-        embedding_dim = data.get("semantic_graph", {}).get("embedding_dim", 1536)
+        embedding_dim = data.get("semantic_graph", {}).get("embedding_dim", 3072)
         graph = cls(embedding_dim=embedding_dim)
 
         # Restore sub-graphs via their own from_dict

@@ -65,6 +65,10 @@ class EntityExtractor:
         (r"(\w+(?:\s\w+)?)\s+(?:is\s+)?married\s+to\s+(\w+(?:\s\w+)?)", "married_to"),
         (r"(\w+(?:\s\w+)?)\s+works?\s+(?:at|for)\s+(.+?)(?:\.|,|$)", "works_at"),
         (r"(\w+(?:\s\w+)?)\s+lives?\s+(?:in|at)\s+(.+?)(?:\.|,|$)", "lives_in"),
+        # Origin/homeland
+        (r"(?:my|his|her|their|(\w+(?:\s\w+)?)'s)\s+home\s+(?:country|town|city)[,]?\s+(\w+(?:\s+\w+)?)", "is_from"),
+        (r"(\w+(?:\s\w+)?)\s+(?:is\s+)?originally\s+from\s+(.+?)(?:\.|,|$)", "is_from"),
+        (r"(\w+(?:\s\w+)?)\s+(?:came|moved|emigrated|immigrated)\s+from\s+(.+?)(?:\.|,|$)", "moved_from"),
         # Possession
         (r"(\w+(?:\s\w+)?)'s\s+(\w+)", "has"),
         (r"(\w+(?:\s\w+)?)\s+(?:has|have|own)s?\s+(?:a\s+)?(.+?)(?:\.|,|$)", "has"),
@@ -183,13 +187,19 @@ class EntityExtractor:
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 groups = match.groups()
                 if len(groups) >= 2:
+                    subject = groups[0]
+                    obj = groups[1]
+                    # Skip if either group is None (e.g. pronoun-only patterns)
+                    if not subject or not obj:
+                        continue
+
                     # Check for negation
                     negated = self._is_negated(text, match.start())
 
                     relation = ExtractedRelation(
-                        subject=groups[0].strip(),
+                        subject=subject.strip(),
                         predicate=relation_type,
-                        object=groups[1].strip(),
+                        object=obj.strip(),
                         negated=negated,
                         span=(match.start(), match.end()),
                     )

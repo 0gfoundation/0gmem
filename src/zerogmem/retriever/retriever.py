@@ -7,6 +7,8 @@ position-aware composition to combat lost-in-the-middle.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +16,9 @@ from typing import Any
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
+from zerogmem.defaults import DEFAULT_LLM_MODEL, llm_chat_kwargs
 from zerogmem.memory.manager import MemoryManager
 from zerogmem.retriever.attention_filter import AttentionFilter, FilterConfig
 from zerogmem.retriever.query_analyzer import (
@@ -22,6 +27,12 @@ from zerogmem.retriever.query_analyzer import (
     QueryIntent,
     ReasoningType,
     TemporalScope,
+)
+from zerogmem.retriever.entity_scorer import EntityScorer, EntityScoringConfig, ScoredResult
+from zerogmem.retriever.hierarchical_search import (
+    HierarchicalIndex,
+    HierarchicalIndexConfig,
+    HierarchicalSearch,
 )
 from zerogmem.retriever.reranker import CrossEncoderReranker
 
@@ -43,6 +54,17 @@ class RetrievalResult:
     confidence: float = 1.0
     negated: bool = False
 
+    @property
+    def scoring_content(self) -> str:
+        """Content used for scoring/reranking stages.
+
+        For proposition-sourced results this returns the focused sentence
+        that matched the query, rather than the full parent message.
+        The full parent message is kept in ``content`` for final context
+        composition so the LLM sees the complete information.
+        """
+        return self.metadata.get("proposition_content") or self.content
+
 
 @dataclass
 class RetrievalResponse:
@@ -60,15 +82,15 @@ class RetrievalResponse:
 class RetrieverConfig:
     """Configuration for the retriever."""
 
-    top_k: int = 20  # Increased for larger conversations
+    top_k: int = 30
     semantic_weight: float = 0.4
     temporal_weight: float = 0.3
     entity_weight: float = 0.2
     recency_weight: float = 0.1
-    max_context_tokens: int = 8000  # Increased for larger conversations
+    max_context_tokens: int = 16000  # Token budget for composed context
     use_position_aware_composition: bool = True
     check_negations: bool = True
-    use_reranker: bool = False
+    use_reranker: bool = True
     rerank_top_n: int = 30
     rerank_weight: float = 0.6
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -77,12 +99,35 @@ class RetrieverConfig:
     rrf_k: int = 60  # Standard RRF constant
     # Agentic retrieval settings
     use_agentic_retrieval: bool = True
-    max_retrieval_rounds: int = 3
-    sufficiency_threshold: float = 0.6  # Min confidence to stop retrieval
+    max_retrieval_rounds: int = 2
+    sufficiency_threshold: float = 0.5  # Min confidence to stop retrieval
     # Attention filter settings - "precise forgetting"
     use_attention_filter: bool = True
-    attention_relevance_threshold: float = 0.3
-    attention_diversity_weight: float = 0.3
+    attention_relevance_threshold: float = 0.10
+    attention_diversity_weight: float = 0.2
+    # BM25 sparse retrieval settings
+    use_bm25: bool = True
+    bm25_weight: float = 1.0  # RRF weight for BM25 strategy
+    # Retrieval-time reasoning (requires consolidator with LLM client)
+    use_retrieval_reasoning: bool = False
+    # Entity-aware scoring (graduated scoring instead of binary filter)
+    entity_scoring: EntityScoringConfig = field(default_factory=EntityScoringConfig)
+    # Hierarchical search settings
+    use_hierarchical_search: bool = True
+    hierarchical_weight: float = 1.0
+    hierarchical_use_decomposition: bool = True
+    # LLM reranker settings (requires llm_client passed to Retriever)
+    use_llm_reranker: bool = True
+    llm_rerank_top_n: int = 50
+    llm_reranker_model: str = DEFAULT_LLM_MODEL
+    # LLM-based BM25 relevance filter (pre-RRF noise removal)
+    use_llm_bm25_filter: bool = True
+    # LLM sufficiency validation (borderline cases)
+    use_llm_sufficiency: bool = True
+    llm_sufficiency_low: float = 0.5
+    llm_sufficiency_high: float = 0.85
+    # LLM query rewriting (last resort after rule-based strategies)
+    use_llm_rewrite: bool = True
 
 
 class Retriever:
@@ -102,18 +147,33 @@ class Retriever:
         memory_manager: MemoryManager,
         config: RetrieverConfig | None = None,
         embedding_fn: Callable[[str], np.ndarray] | None = None,
+        llm_client: Any | None = None,
+        llm_model: str | None = None,
     ):
         self.memory = memory_manager
         self.config = config or RetrieverConfig()
         self._embedding_fn = embedding_fn or memory_manager._embed_fn
+        self.llm_client = llm_client
+        self.llm_model = llm_model or DEFAULT_LLM_MODEL
 
-        self.query_analyzer = QueryAnalyzer()
+        self.query_analyzer = QueryAnalyzer(
+            llm_client=llm_client, llm_model=self.llm_model
+        )
         self.reranker = None
         if self.config.use_reranker:
             try:
                 self.reranker = CrossEncoderReranker(model_name=self.config.reranker_model)
             except Exception as e:
                 print(f"Reranker init failed: {e}")
+
+        # Initialize entity scorer for graduated entity-aware scoring
+        self.entity_scorer: EntityScorer | None = None
+        if self.config.entity_scoring.enabled:
+            self.entity_scorer = EntityScorer(self.config.entity_scoring)
+
+        # Initialize hierarchical search (lazy — index built on first retrieval)
+        self._hierarchical_search: HierarchicalSearch | None = None
+        self._hierarchical_index_built = False
 
         # Initialize attention filter for "precise forgetting"
         self.attention_filter = None
@@ -126,6 +186,29 @@ class Retriever:
             self.attention_filter = AttentionFilter(
                 config=filter_config,
                 embedding_fn=self._embedding_fn,
+            )
+
+    def _ensure_hierarchical_index(self) -> None:
+        """Build hierarchical index lazily on first retrieval."""
+        if self._hierarchical_index_built or not self.config.use_hierarchical_search:
+            return
+        self._hierarchical_index_built = True
+
+        hi_config = HierarchicalIndexConfig()
+        index = HierarchicalIndex(
+            config=hi_config,
+            embedding_fn=self._embedding_fn,
+            llm_client=self.llm_client,
+            llm_model=self.llm_model,
+        )
+        index.build_from_memory(self.memory)
+
+        if not index.is_empty():
+            self._hierarchical_search = HierarchicalSearch(
+                index=index,
+                memory=self.memory,
+                embedding_fn=self._embedding_fn,
+                config=hi_config,
             )
 
     def retrieve(
@@ -151,11 +234,53 @@ class Retriever:
 
         return self._single_pass_retrieve(query, context, override_strategy)
 
+    def answer(
+        self,
+        query: str,
+        *,
+        category: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Retrieve context and generate an answer in one call.
+
+        Args:
+            query: The question to answer.
+            category: Optional category hint (e.g. "temporal", "adversarial").
+
+        Returns:
+            (answer_text, metadata) where metadata includes retrieval and
+            generation details.
+        """
+        from zerogmem.reasoning.answer_generator import AnswerConfig, AnswerGenerator
+
+        retrieval = self.retrieve(query)
+        context = retrieval.composed_context
+        target_entity = retrieval.query_analysis.target_entity
+
+        if not self.llm_client:
+            return "None", {"context": context, "target_entity": target_entity}
+
+        generator = AnswerGenerator(
+            llm_client=self.llm_client,
+            config=AnswerConfig(llm_model=self.llm_model),
+        )
+        answer, gen_meta = generator.generate_answer(
+            query=query,
+            context=context,
+            category=category,
+            target_entity=target_entity,
+        )
+        gen_meta["context"] = context
+        gen_meta["target_entity"] = target_entity
+        gen_meta["num_results"] = len(retrieval.results)
+        return answer, gen_meta
+
     def _single_pass_retrieve(
         self,
         query: str,
         context: dict[str, Any] | None = None,
         override_strategy: dict[str, Any] | None = None,
+        *,
+        skip_entity_scoring: bool = False,
     ) -> RetrievalResponse:
         """Single-pass retrieval (original implementation)."""
         # Analyze query
@@ -169,6 +294,27 @@ class Retriever:
         # Execute retrieval based on strategy
         results = self._execute_retrieval(query, analysis, strategy)
 
+        # Entity isolation: filter or score results for the target entity.
+        # Critical for multi-person conversations where results must be
+        # scoped to a specific participant. The target_entity is identified
+        # by QueryAnalyzer from the query structure, or overridden by the caller.
+        # Skip for gap-filling rounds — round 2+ queries specifically target
+        # cross-entity info that round 1 missed.
+        target_entity = analysis.target_entity
+        if target_entity and results and not skip_entity_scoring:
+            original_results = list(results)
+            if self.entity_scorer:
+                # Graduated scoring (Phase 1 migration from locomo.py)
+                results = self._apply_entity_scoring(
+                    results, target_entity, analysis, query
+                )
+            else:
+                # Binary filter fallback
+                results = self._filter_by_entity(results, target_entity)
+            # Safety: if entity scoring removes ALL results, fall back to original
+            if not results:
+                results = original_results
+
         # Check negations if needed
         if strategy.get("check_negations") and analysis.is_negation_check:
             results = self._verify_negations(results, analysis)
@@ -177,8 +323,11 @@ class Retriever:
         if self.reranker and self.config.use_reranker and results:
             results = self._apply_reranker(query, results)
 
-        # Score and rank results
-        results = self._rank_results(results, analysis, strategy)
+        # Final scoring: LLM reranker (holistic) or heuristic _rank_results (fallback)
+        if self.llm_client and self.config.use_llm_reranker and results:
+            results = self._llm_rerank(query, results, analysis)
+        else:
+            results = self._rank_results(results, analysis, strategy)
 
         # Apply attention filter for "precise forgetting"
         # This removes redundant/low-relevance content that dilutes LLM attention
@@ -253,8 +402,12 @@ class Retriever:
 
             queries_tried.append(rewritten_query)
 
-            # Retrieve with rewritten query
-            new_response = self._single_pass_retrieve(rewritten_query, context, override_strategy)
+            # Retrieve with rewritten query — skip entity scoring since
+            # gap-filling rounds target cross-entity info round 1 missed
+            new_response = self._single_pass_retrieve(
+                rewritten_query, context, override_strategy,
+                skip_entity_scoring=True,
+            )
 
             # Add new results (avoiding duplicates)
             seen_ids = {r.id for r in all_results}
@@ -285,12 +438,11 @@ class Retriever:
                 }
             )
 
-        # Final ranking and composition with all accumulated results
-        final_results = self._rank_results(
-            all_results,
-            response.query_analysis,
-            response.strategy_used,
-        )[: self.config.top_k]
+        # Final ranking of merged results from all rounds.
+        # Each round's results were already scored (LLM reranker or heuristic)
+        # inside _single_pass_retrieve(), so just sort by score.
+        all_results.sort(key=lambda r: r.score, reverse=True)
+        final_results = all_results[: self.config.top_k]
 
         composed_context = self._compose_context(final_results, response.query_analysis)
 
@@ -360,7 +512,21 @@ class Retriever:
         # Weighted average
         if not scores:
             return 0.5  # Default
-        return sum(scores) / len(scores)
+        heuristic_score = sum(scores) / len(scores)
+
+        # LLM validation — always check when heuristic says sufficient,
+        # because heuristic can be overly optimistic (e.g., "that book you
+        # recommended" matches keywords but doesn't name the actual book).
+        if (
+            self.config.use_llm_sufficiency
+            and self.llm_client
+            and heuristic_score >= self.config.llm_sufficiency_low
+        ):
+            llm_result = self._llm_check_sufficiency(query, response.results[:5])
+            if llm_result is not None:
+                return llm_result
+
+        return heuristic_score
 
     def _rewrite_query(
         self,
@@ -377,7 +543,16 @@ class Retriever:
         # Extract what we might be missing
         query_lower = original_query.lower()
 
-        # Strategy 1: Focus on specific entities not found
+        # Strategy 1 (primary): LLM gap-aware rewriting — best at identifying
+        # unresolved references like "that book" or "home country"
+        if self.config.use_llm_rewrite and self.llm_client:
+            llm_query = self._llm_rewrite_query(
+                original_query, previous_queries, current_results
+            )
+            if llm_query and llm_query not in previous_queries:
+                return llm_query
+
+        # Strategy 2: Focus on specific entities not found
         for entity in analysis.entities:
             entity_found = any(entity.lower() in r.content.lower() for r in current_results[:10])
             if not entity_found:
@@ -386,7 +561,7 @@ class Retriever:
                 if new_query not in previous_queries:
                     return new_query
 
-        # Strategy 2: Use synonyms/related terms for keywords
+        # Strategy 3: Use synonyms/related terms for keywords
         keyword_expansions = {
             "like": ["enjoy", "love", "prefer", "favorite"],
             "when": ["date", "time", "year", "month"],
@@ -403,15 +578,6 @@ class Retriever:
                     new_query = original_query.replace(kw, expansion)
                     if new_query not in previous_queries:
                         return new_query
-
-        # Strategy 3: Decompose multi-hop queries
-        if analysis.reasoning_type == ReasoningType.MULTI_HOP:
-            # Try searching for entities separately
-            if len(analysis.entities) > 1:
-                for entity in analysis.entities:
-                    simple_query = f"{entity}"
-                    if simple_query not in previous_queries:
-                        return simple_query
 
         # Strategy 4: Add temporal context
         if "when" in query_lower or "date" in query_lower or "time" in query_lower:
@@ -463,11 +629,50 @@ class Retriever:
         # 6. Working memory
         strategy_results["working_memory"] = self._working_memory_search(query_embedding)
 
-        # 7. Keyword-based search (for multi-hop and commonsense)
-        if analysis.reasoning_type in [ReasoningType.MULTI_HOP, ReasoningType.COMMONSENSE]:
+        # 7. BM25 sparse keyword search (always runs if available)
+        if self.config.use_bm25 and self.memory.bm25 is not None:
+            bm25_results = self._bm25_search(
+                query, top_k=strategy.get("top_k", 30), analysis=analysis
+            )
+            # Pre-RRF LLM filter: remove BM25 noise (function-word matches)
+            if self.config.use_llm_bm25_filter and bm25_results:
+                bm25_results = self._llm_filter_bm25(query, bm25_results)
+            strategy_results["bm25"] = bm25_results
+        elif analysis.reasoning_type in [ReasoningType.MULTI_HOP, ReasoningType.COMMONSENSE]:
+            # Fallback to naive keyword search when BM25 is not available
             strategy_results["keyword"] = self._keyword_search(
                 analysis.keywords + analysis.entities
             )
+
+        # 8. Hierarchical tree-search
+        if self.config.use_hierarchical_search:
+            self._ensure_hierarchical_index()
+        if self._hierarchical_search:
+            # Prefer LLM-generated sub-queries over keyword-based decomposition
+            llm_sub_queries = analysis.metadata.get("sub_queries") if analysis else None
+            # Hierarchical returns raw messages found via tree search — use same
+            # pool size as semantic/BM25 so it gets fair representation in RRF.
+            h_top_k = strategy.get("top_k", 20)
+            if llm_sub_queries and len(llm_sub_queries) > 1:
+                strategy_results["hierarchical"] = self._hierarchical_search.search_decomposed(
+                    query, llm_sub_queries, query_embedding,
+                    top_k=h_top_k,
+                )
+            elif (
+                self.config.hierarchical_use_decomposition
+                and analysis.reasoning_type
+                in (ReasoningType.MULTI_HOP, ReasoningType.TEMPORAL, ReasoningType.CAUSAL)
+            ):
+                sub_queries = self._hierarchical_search.generate_sub_queries(query, analysis)
+                strategy_results["hierarchical"] = self._hierarchical_search.search_decomposed(
+                    query, sub_queries, query_embedding,
+                    top_k=h_top_k,
+                )
+            else:
+                strategy_results["hierarchical"] = self._hierarchical_search.search(
+                    query, query_embedding, analysis,
+                    top_k=h_top_k,
+                )
 
         # Use RRF fusion if enabled, otherwise simple merge
         if self.config.use_rrf:
@@ -483,6 +688,15 @@ class Retriever:
             dialogue_results = self._get_dialogue_context(all_results)
             all_results.extend(dialogue_results)
             all_results = self._deduplicate(all_results)
+
+        # 9. Retrieval-time reasoning (LLM-based gap filling)
+        if self.config.use_retrieval_reasoning and self.memory.consolidator:
+            reasoning_results = self.memory.consolidator.reason_at_retrieval(
+                query, all_results, analysis
+            )
+            if reasoning_results:
+                all_results.extend(reasoning_results)
+                all_results = self._deduplicate(all_results)
 
         return all_results
 
@@ -562,19 +776,30 @@ class Retriever:
             "fact": 1.0,
             "working_memory": 1.2,
             "keyword": 0.6,
+            "bm25": self.config.bm25_weight,
         }
+        # Only include hierarchical weight when the strategy is active
+        if self._hierarchical_search is not None:
+            weights["hierarchical"] = self.config.hierarchical_weight
 
         # Adjust based on query type
         if analysis.reasoning_type == ReasoningType.TEMPORAL:
             weights["temporal"] = 1.3
             weights["semantic"] = 0.8
+            weights["bm25"] = 0.8  # Temporal queries rely less on keyword matching
+            if "hierarchical" in weights:
+                weights["hierarchical"] = 1.2
         elif analysis.reasoning_type == ReasoningType.MULTI_HOP:
             weights["graph"] = 1.2
             weights["entity"] = 1.0
             weights["keyword"] = 0.8
+            weights["bm25"] = 1.1  # Multi-hop benefits from keyword recall
+            if "hierarchical" in weights:
+                weights["hierarchical"] = 1.3  # Hierarchical especially valuable for multi-hop
         elif analysis.intent == QueryIntent.PREFERENCE:
             weights["fact"] = 1.2
             weights["entity"] = 1.0
+            weights["bm25"] = 1.1  # Preference queries benefit from exact keyword match
 
         return weights
 
@@ -619,7 +844,7 @@ class Retriever:
         return context_results
 
     def _keyword_search(self, keywords: list[str]) -> list[RetrievalResult]:
-        """Search for memories containing specific keywords."""
+        """Search for memories containing specific keywords (fallback when BM25 unavailable)."""
         results = []
         seen_ids = set()
 
@@ -645,6 +870,229 @@ class Retriever:
 
         return results
 
+    def _expand_query_from_graph(
+        self, query: str, analysis: QueryAnalysis
+    ) -> list[str]:
+        """Generate additional BM25 search queries from entity graph profiles.
+
+        When a target entity is identified, expands the query using:
+        1. Entity name itself
+        2. Relation targets from the entity profile (e.g., interested_in→hiking)
+        3. Entity attributes (stored facts)
+        4. Keywords from top associated memories
+
+        This replaces hardcoded per-entity keyword lists with dynamic graph lookups.
+        """
+        expanded = [query]
+        target = analysis.target_entity
+        if not target:
+            return expanded
+
+        # Search with just the entity name
+        expanded.append(target)
+
+        # Look up entity in the graph
+        entity_nodes = self.memory.graph.entity_graph.find_by_name(target)
+        if not entity_nodes:
+            return expanded
+
+        entity = entity_nodes[0]
+
+        # Extract expansion terms from entity relations (limit to top 5)
+        profile = self.memory.graph.entity_graph.get_entity_profile(entity.id)
+        relation_terms: list[str] = []
+        for rel in profile.get("relations", [])[:10]:
+            related_name = rel.get("entity", "")
+            relation_type = rel.get("relation", "")
+            if related_name and relation_type not in ("speaks_with", "knows"):
+                relation_terms.append(related_name)
+        # Use top 5 most relevant relation terms
+        for term in relation_terms[:5]:
+            expanded.append(f"{target} {term}")
+
+        # Extract keywords from entity attributes
+        for attr_key, attr_val in entity.attributes.items():
+            if isinstance(attr_val, str) and len(attr_val) < 50:
+                expanded.append(f"{target} {attr_val}")
+            elif isinstance(attr_val, list):
+                for v in attr_val[:3]:
+                    if isinstance(v, str) and len(v) < 50:
+                        expanded.append(f"{target} {v}")
+
+        # Extract key terms from associated memories (top 5)
+        memories = self.memory.graph.query_by_entity(entity.id)
+        for mem in memories[:5]:
+            # Extract nouns/key terms from memory content (simple heuristic)
+            words = mem.content.split()
+            # Take content-bearing words (skip very short/common words)
+            key_words = [
+                w for w in words
+                if len(w) > 3 and w.lower() not in {
+                    "that", "this", "with", "from", "they", "have", "been",
+                    "were", "said", "told", "about", "what", "when", "where",
+                    "will", "would", "could", "should", "there", "their",
+                    "also", "just", "very", "much", "some", "like",
+                }
+            ][:5]
+            if key_words:
+                expanded.append(f"{target} {' '.join(key_words)}")
+
+        return expanded
+
+    def _bm25_search(
+        self, query: str, top_k: int = 20, analysis: QueryAnalysis | None = None
+    ) -> list[RetrievalResult]:
+        """BM25 sparse keyword search with query expansion.
+
+        Uses the BM25 index on MemoryManager for proper TF-IDF scoring,
+        query expansion, and inverted-index retrieval. When an analysis
+        is provided, also expands queries using entity graph profiles.
+        """
+        if self.memory.bm25 is None or self.memory.bm25.total_docs == 0:
+            return []
+
+        # Get expanded queries from entity graph if analysis is available
+        queries = self._expand_query_from_graph(query, analysis) if analysis else [query]
+
+        # Search with all expanded queries, deduplicate by doc_id (keep highest score)
+        best_hits: dict[str, tuple[float, str]] = {}
+        for q in queries:
+            for doc_id, score, content in self.memory.bm25.search(
+                q, top_k=top_k, use_expansion=True
+            ):
+                if doc_id not in best_hits or score > best_hits[doc_id][0]:
+                    best_hits[doc_id] = (score, content)
+
+        # Sort by score and take top_k
+        sorted_hits = sorted(best_hits.items(), key=lambda x: x[1][0], reverse=True)[
+            :top_k
+        ]
+
+        results = []
+        for doc_id, (score, content) in sorted_hits:
+            memory = self.memory.graph.memories.get(doc_id)
+            results.append(
+                RetrievalResult(
+                    id=doc_id,
+                    content=content,
+                    score=score,
+                    source="bm25",
+                    entities=memory.entity_names if memory else [],
+                    timestamp=(
+                        memory.event_time.start.isoformat()
+                        if memory and memory.event_time
+                        else None
+                    ),
+                    metadata={
+                        "bm25_raw_score": score,
+                        "speaker": memory.speaker if memory else "",
+                        "session_timestamp": (
+                            memory.metadata.get("session_timestamp", "")
+                            if memory and memory.metadata
+                            else ""
+                        ),
+                        "session_idx": (
+                            memory.metadata.get("session_idx", 0)
+                            if memory and memory.metadata
+                            else 0
+                        ),
+                    },
+                )
+            )
+        return results
+
+    @staticmethod
+    def _filter_by_entity(
+        results: list[RetrievalResult], target_entity: str
+    ) -> list[RetrievalResult]:
+        """Filter retrieval results to those mentioning a specific entity.
+
+        Essential for multi-person conversations where the question is about
+        a particular participant and results from other participants are noise.
+        Results that mention the target entity (in metadata or content) are
+        kept; others are discarded.
+        """
+        target_lower = target_entity.lower()
+        filtered = []
+        for r in results:
+            # Check entity list first (fast)
+            if any(target_lower in e.lower() for e in r.entities):
+                filtered.append(r)
+            # Fall back to content substring match
+            elif target_lower in r.content.lower():
+                filtered.append(r)
+        return filtered if filtered else results  # Never return empty
+
+    def _apply_entity_scoring(
+        self,
+        results: list[RetrievalResult],
+        target_entity: str,
+        analysis: QueryAnalysis,
+        query: str,
+    ) -> list[RetrievalResult]:
+        """Apply graduated entity scoring to results (replaces binary filter).
+
+        Converts RetrievalResults to ScoredResults, runs EntityScorer,
+        then converts back, updating scores.
+        """
+        assert self.entity_scorer is not None
+
+        # Build ScoredResult list from RetrievalResults
+        scored_inputs = []
+        for r in results:
+            speaker = r.metadata.get("speaker", "")
+            session_idx = r.metadata.get("session_idx", 0)
+            scored_inputs.append(
+                ScoredResult(
+                    id=r.id,
+                    original_score=r.score,
+                    adjusted_score=r.score,
+                    content=r.content,
+                    speaker=speaker,
+                    session_idx=session_idx,
+                    metadata=r.metadata,
+                )
+            )
+
+        # Determine known speakers from memory graph
+        known_speakers: set[str] | None = None
+        entity_graph = getattr(self.memory.graph, "entity_graph", None)
+        if entity_graph:
+            known_speakers = set()
+            for node in entity_graph.nodes.values():
+                known_speakers.add(node.name)
+
+        # Detect question characteristics
+        is_adversarial = analysis.reasoning_type == ReasoningType.ADVERSARIAL
+        is_multi_hop = analysis.reasoning_type == ReasoningType.MULTI_HOP
+
+        # Collect related entities (all query entities except the target)
+        related_entities = [
+            e for e in analysis.entities
+            if e.lower() != target_entity.lower()
+        ]
+
+        scored_results = self.entity_scorer.score_results(
+            scored_inputs,
+            target_entity,
+            is_adversarial=is_adversarial,
+            is_multi_hop=is_multi_hop,
+            query=query,
+            known_speakers=known_speakers,
+            related_entities=related_entities,
+        )
+
+        # Map back to RetrievalResults, updating scores
+        id_to_result = {r.id: r for r in results}
+        output = []
+        for sr in scored_results:
+            original = id_to_result.get(sr.id)
+            if original:
+                original.score = sr.adjusted_score
+                output.append(original)
+
+        return output if output else results
+
     def _semantic_search(
         self, query_embedding: np.ndarray, top_k: int = 20
     ) -> list[RetrievalResult]:
@@ -663,27 +1111,140 @@ class Retriever:
                     source="semantic",
                     entities=memory.entity_names,
                     timestamp=memory.event_time.start.isoformat() if memory.event_time else None,
-                    metadata={"original_score": score},
+                    metadata={
+                        "original_score": score,
+                        "speaker": memory.speaker,
+                        "session_timestamp": (
+                            memory.metadata.get("session_timestamp", "")
+                            if memory.metadata
+                            else ""
+                        ),
+                        "session_idx": (
+                            memory.metadata.get("session_idx", 0)
+                            if memory.metadata
+                            else 0
+                        ),
+                    },
                 )
             )
 
-        # Search episodic memory
+        # Search episodic memory — expand matched episodes into raw messages
         episodes = self.memory.episodic_memory.search_similar(query_embedding, top_k=top_k // 2)
+        seen_ids = {r.id for r in results}
 
         for episode, score in episodes:
-            results.append(
+            # Find raw messages in unified graph that belong to this episode's session
+            expanded = self._expand_episode_to_messages(
+                episode, query_embedding, score, seen_ids
+            )
+            results.extend(expanded)
+            seen_ids.update(r.id for r in expanded)
+
+        # Search proposition index for fine-grained sentence-level matches
+        if self.memory.proposition_index is not None:
+            prop_results = self.memory.proposition_index.search(
+                query_embedding, top_k=top_k
+            )
+            for prop, score in prop_results:
+                parent = self.memory.graph.memories.get(prop.parent_memory_id)
+                if not parent:
+                    continue
+                if parent.id not in seen_ids:
+                    results.append(
+                        RetrievalResult(
+                            id=parent.id,
+                            content=parent.content,
+                            score=score,
+                            source="proposition",
+                            entities=parent.entity_names,
+                            timestamp=(
+                                parent.event_time.start.isoformat()
+                                if parent.event_time
+                                else None
+                            ),
+                            metadata={
+                                "proposition_content": prop.content,
+                                "original_score": score,
+                                "speaker": parent.speaker,
+                            },
+                        )
+                    )
+                    seen_ids.add(parent.id)
+                else:
+                    # Update score if proposition match is higher
+                    for r in results:
+                        if r.id == parent.id and score > r.score:
+                            r.score = score
+                            r.metadata["proposition_content"] = prop.content
+                            break
+
+        return results
+
+    def _expand_episode_to_messages(
+        self,
+        episode: Any,
+        query_embedding: np.ndarray,
+        episode_score: float,
+        seen_ids: set[str],
+    ) -> list[RetrievalResult]:
+        """Expand a matched episode into its constituent raw messages.
+
+        Instead of returning the episode summary (which loses detail),
+        find the original messages in the unified graph and return them
+        individually, scored by similarity to the query.
+        """
+        candidates: list[RetrievalResult] = []
+        session_id = episode.session_id
+
+        # Find graph memories belonging to this episode's session
+        for mem in self.memory.graph.memories.values():
+            if mem.id in seen_ids:
+                continue
+            if mem.session_id != session_id:
+                continue
+            if mem.metadata and mem.metadata.get("source_type") == "session_summary":
+                continue
+
+            # Score by cosine similarity to query
+            if mem.embedding is not None:
+                m_norm = mem.embedding / (np.linalg.norm(mem.embedding) + 1e-8)
+                q_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
+                sim = float(q_norm @ m_norm)
+            else:
+                sim = 0.3
+
+            candidates.append(
                 RetrievalResult(
-                    id=episode.id,
-                    content=episode.summary or episode.get_full_text()[:500],
-                    score=score * 0.9,  # Slightly lower weight for episodes
-                    source="episode",
-                    entities=episode.participant_names,
-                    timestamp=episode.start_time.isoformat(),
-                    metadata={"episode_id": episode.id, "message_count": episode.message_count},
+                    id=mem.id,
+                    content=mem.content,
+                    score=sim,
+                    source="episode_expanded",
+                    entities=mem.entity_names,
+                    timestamp=(
+                        mem.event_time.start.isoformat()
+                        if mem.event_time and mem.event_time.start
+                        else None
+                    ),
+                    metadata={
+                        "episode_id": episode.id,
+                        "speaker": mem.speaker,
+                        "session_timestamp": (
+                            mem.metadata.get("session_timestamp", "")
+                            if mem.metadata
+                            else ""
+                        ),
+                        "session_idx": (
+                            mem.metadata.get("session_idx", 0)
+                            if mem.metadata
+                            else 0
+                        ),
+                    },
                 )
             )
 
-        return results
+        # Return top messages by similarity (don't flood with entire session)
+        candidates.sort(key=lambda r: r.score, reverse=True)
+        return candidates[:10]
 
     def _entity_search(self, entities: list[str]) -> list[RetrievalResult]:
         """Search by entity mentions."""
@@ -731,8 +1292,11 @@ class Retriever:
         return results
 
     def _temporal_search(self, analysis: QueryAnalysis) -> list[RetrievalResult]:
-        """Search based on temporal constraints."""
+        """Search based on temporal constraints including Allen's interval relations."""
+        from zerogmem.graph.temporal import TemporalRelation
+
         results = []
+        seen_ids: set[str] = set()
 
         # Extract time constraints from temporal expressions
         for expr in analysis.temporal_expressions:
@@ -745,46 +1309,90 @@ class Retriever:
                 )
 
                 for memory in memories[:10]:
-                    results.append(
-                        RetrievalResult(
-                            id=memory.id,
-                            content=memory.content,
-                            score=0.8,
-                            source="temporal",
-                            entities=memory.entity_names,
-                            timestamp=(
-                                memory.event_time.start.isoformat() if memory.event_time else None
-                            ),
-                            reasoning_path=[f"temporal:{expr.text}"],
+                    if memory.id not in seen_ids:
+                        seen_ids.add(memory.id)
+                        results.append(
+                            RetrievalResult(
+                                id=memory.id,
+                                content=memory.content,
+                                score=0.8,
+                                source="temporal",
+                                entities=memory.entity_names,
+                                timestamp=(
+                                    memory.event_time.start.isoformat()
+                                    if memory.event_time
+                                    else None
+                                ),
+                                reasoning_path=[f"temporal:{expr.text}"],
+                            )
                         )
+
+                # Allen's temporal relation expansion for before/after queries
+                query_lower = analysis.original_query.lower() if analysis.original_query else ""
+                relation = None
+                if any(w in query_lower for w in ["before", "prior to", "earlier"]):
+                    relation = TemporalRelation.BEFORE
+                elif any(w in query_lower for w in ["after", "since", "following"]):
+                    relation = TemporalRelation.AFTER
+
+                if relation and results:
+                    # Use the first temporal result as reference point
+                    ref_id = results[0].id
+                    expanded = self.memory.graph.query_temporal_relative(
+                        ref_id, relation, limit=5
                     )
+                    for memory in expanded:
+                        if memory.id not in seen_ids:
+                            seen_ids.add(memory.id)
+                            results.append(
+                                RetrievalResult(
+                                    id=memory.id,
+                                    content=memory.content,
+                                    score=0.65,
+                                    source="temporal_allen",
+                                    entities=memory.entity_names,
+                                    timestamp=(
+                                        memory.event_time.start.isoformat()
+                                        if memory.event_time
+                                        else None
+                                    ),
+                                    reasoning_path=[
+                                        f"temporal_allen:{relation.value}:{ref_id}"
+                                    ],
+                                )
+                            )
 
         # Handle relative temporal queries
         if analysis.temporal_scope == TemporalScope.RELATIVE and analysis.entities:
             for entity in analysis.entities:
                 chain = self.memory.graph.find_temporal_chain(entity)
                 for memory in chain[:10]:
-                    results.append(
-                        RetrievalResult(
-                            id=memory.id,
-                            content=memory.content,
-                            score=0.75,
-                            source="temporal_chain",
-                            entities=memory.entity_names,
-                            timestamp=(
-                                memory.event_time.start.isoformat() if memory.event_time else None
-                            ),
-                            reasoning_path=[f"temporal_chain:{entity}"],
+                    if memory.id not in seen_ids:
+                        seen_ids.add(memory.id)
+                        results.append(
+                            RetrievalResult(
+                                id=memory.id,
+                                content=memory.content,
+                                score=0.75,
+                                source="temporal_chain",
+                                entities=memory.entity_names,
+                                timestamp=(
+                                    memory.event_time.start.isoformat()
+                                    if memory.event_time
+                                    else None
+                                ),
+                                reasoning_path=[f"temporal_chain:{entity}"],
+                            )
                         )
-                    )
 
         return results
 
     def _graph_traversal(
         self, analysis: QueryAnalysis, query_embedding: np.ndarray | None, max_hops: int = 2
     ) -> list[RetrievalResult]:
-        """Multi-hop graph traversal for complex queries."""
+        """Multi-hop graph traversal with causal chain expansion."""
         results: list[RetrievalResult] = []
+        seen_ids: set[str] = set()
 
         if not analysis.entities:
             return results
@@ -798,6 +1406,7 @@ class Retriever:
         )
 
         for memory, score, path in multi_hop_results:
+            seen_ids.add(memory.id)
             results.append(
                 RetrievalResult(
                     id=memory.id,
@@ -810,6 +1419,36 @@ class Retriever:
                     metadata={"hop_count": len(path)},
                 )
             )
+
+        # Causal chain expansion: for multi-hop/commonsense queries, follow
+        # cause→effect chains to surface implied context
+        if analysis.reasoning_type in (ReasoningType.MULTI_HOP, ReasoningType.COMMONSENSE):
+            for result in list(results)[:5]:  # Expand from top results
+                for direction in ("causes", "effects"):
+                    chains = self.memory.graph.query_causal_chain(
+                        result.id, direction=direction, max_depth=2
+                    )
+                    for chain in chains[:3]:
+                        for memory in chain:
+                            if memory.id not in seen_ids:
+                                seen_ids.add(memory.id)
+                                results.append(
+                                    RetrievalResult(
+                                        id=memory.id,
+                                        content=memory.content,
+                                        score=0.6,
+                                        source="causal_chain",
+                                        entities=memory.entity_names,
+                                        timestamp=(
+                                            memory.event_time.start.isoformat()
+                                            if memory.event_time
+                                            else None
+                                        ),
+                                        reasoning_path=[
+                                            f"causal:{direction}:{result.id}"
+                                        ],
+                                    )
+                                )
 
         return results
 
@@ -1005,6 +1644,7 @@ class Retriever:
             source_weights = {
                 "working_memory": 1.2,
                 "semantic": 1.0,
+                "bm25": 1.0,
                 "fact": 1.0,
                 "temporal": 0.9 if analysis.reasoning_type == ReasoningType.TEMPORAL else 0.7,
                 "entity": 0.8,
@@ -1073,16 +1713,14 @@ class Retriever:
         return results
 
     def _apply_reranker(self, query: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
-        """Re-rank top candidates with a cross-encoder."""
+        """Re-rank ALL candidates with a cross-encoder."""
         if not self.reranker or not results:
             return results
 
-        # Use current score ordering for candidate selection
-        candidates = sorted(results, key=lambda r: r.score, reverse=True)
-        top_n = min(self.config.rerank_top_n, len(candidates))
-        top = candidates[:top_n]
-
-        texts = [r.content for r in top]
+        # Score ALL candidates — cross-encoder is a local model, so cost is trivial.
+        # Partial reranking creates rank inversions where reranked items can fall
+        # below items that were never scored.
+        texts = [r.scoring_content for r in results]
         scores = self.reranker.score_pairs(query, texts)
         if not scores:
             return results
@@ -1096,12 +1734,326 @@ class Retriever:
             norm_scores = [(s - min_s) / span for s in scores]
 
         weight = max(0.0, min(1.0, self.config.rerank_weight))
-        for r, ns in zip(top, norm_scores):
+        for r, ns in zip(results, norm_scores):
             r.metadata["rerank_score"] = ns
             # Scale existing score by reranker signal
             r.score *= 1.0 + weight * (ns - 0.5) * 2.0
 
         return results
+
+    _LLM_RERANK_PROMPT = """You are a relevance judge for a conversational memory retrieval system.
+
+Given the question and its analysis, score each candidate on relevance from 0 to 10.
+
+SCORING GUIDE:
+- 8-10: Directly answers or contains the answer to the question
+- 5-7: Contains closely related information that helps answer the question
+- 2-4: Mentions the topic but doesn't help answer the specific question
+- 0-1: Completely irrelevant
+
+KEY RULES:
+- A candidate that NAMES a specific item asked about deserves 8+ even if worded differently
+  (e.g., "I loved reading Charlotte's Web" answers "What books has X read?" → score 9)
+- Focus on whether the candidate contains ANSWERABLE information, not surface keyword overlap
+- The target entity's OWN statements about themselves are most valuable
+- Date matching is a bonus, not a requirement (unless the question specifies a time)
+- Multiple candidates may COLLECTIVELY contribute to answering the question even if no single
+  one contains the full answer. Score each piece of evidence 5+ if it provides a partial fact
+  that combines with others to form the answer.
+  (e.g., for "How many children does X have?", both "2 younger kids love nature" and
+  "my son got into an accident" are valuable because together they reveal the count)
+
+Return ONLY a JSON array of integer scores, one per candidate, e.g. [8, 2, 5, 1, 9]"""
+
+    def _llm_rerank(
+        self,
+        query: str,
+        results: list[RetrievalResult],
+        analysis: QueryAnalysis,
+    ) -> list[RetrievalResult]:
+        """Rerank ALL candidates using LLM relevance scoring.
+
+        Scores each candidate 0-10 on holistic relevance (temporal fit,
+        entity match, topical alignment). Multiplies with existing score.
+        All candidates are scored to avoid rank inversions where partially
+        reranked items fall below unscored items.
+        Returns results unchanged on failure.
+        """
+        if not self.llm_client or not results:
+            return results
+
+        # Build candidate list for the prompt — score ALL candidates
+        candidate_lines = []
+        for i, r in enumerate(results, 1):
+            # Get speaker and session date from metadata or memory lookup
+            speaker = r.metadata.get("speaker", "")
+            session_date = r.metadata.get("session_timestamp", "")
+            if not speaker or not session_date:
+                memory = self.memory.graph.memories.get(r.id)
+                if memory:
+                    speaker = speaker or memory.speaker
+                    session_date = session_date or memory.metadata.get(
+                        "session_timestamp", ""
+                    )
+            content_preview = r.scoring_content[:200].replace("\n", " ")
+            line = f"{i}. [{speaker}] ({session_date}): {content_preview}"
+            candidate_lines.append(line)
+
+        # Build dates string
+        dates_str = "none"
+        if analysis.temporal_expressions:
+            date_parts = []
+            for expr in analysis.temporal_expressions:
+                if expr.normalized_start:
+                    date_parts.append(expr.normalized_start.strftime("%Y-%m-%d"))
+                else:
+                    date_parts.append(expr.text)
+            dates_str = ", ".join(date_parts)
+
+        user_msg = (
+            f"Question: {query}\n"
+            f"Target entity: {analysis.target_entity or 'unknown'}\n"
+            f"Dates mentioned: {dates_str}\n\n"
+            f"Candidates ({len(results)} total):\n" + "\n".join(candidate_lines)
+            + f"\n\nReturn exactly {len(results)} scores."
+        )
+
+        try:
+            response = self.llm_client.chat.completions.create(
+                **llm_chat_kwargs(self.config.llm_reranker_model, max_tokens=1000, temperature=0.0),
+                messages=[
+                    {"role": "system", "content": self._LLM_RERANK_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            raw_content = response.choices[0].message.content
+            raw = raw_content.strip() if raw_content else ""
+            logger.debug(
+                "LLM reranker raw response (%d chars): %s",
+                len(raw), raw[:200],
+            )
+            if not raw:
+                logger.warning("LLM reranker returned empty response")
+                return results
+            # Strip markdown fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            scores = json.loads(raw)
+
+            if not isinstance(scores, list):
+                logger.warning("LLM reranker returned non-list, skipping")
+                return results
+
+            # Tolerate minor count mismatches (LLM sometimes adds/drops scores)
+            if len(scores) > len(results):
+                scores = scores[: len(results)]
+            elif len(scores) < len(results):
+                # Pad with neutral score (5) for missing entries
+                scores.extend([5] * (len(results) - len(scores)))
+
+            # Multiply existing score by LLM relevance (normalized to 0-1)
+            for r, llm_score in zip(results, scores):
+                s = max(0, min(10, int(llm_score)))
+                r.metadata["llm_rerank_score"] = s
+                # Scale: score 0 → 0.3 (demote), score 10 → 1.5 (boost)
+                # Floor of 0.3 prevents a single LLM misscoring from killing
+                # an otherwise good candidate.
+                multiplier = 0.3 + (s / 10.0) * 1.2
+                r.score *= multiplier
+
+            # Sort all candidates by updated score
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results
+
+        except Exception as e:
+            logger.warning("LLM reranker failed, returning original results: %s", e)
+            return results
+
+    # --- LLM sufficiency validation ---
+
+    _LLM_SUFFICIENCY_PROMPT = """You are judging whether retrieved context can answer a question.
+
+Question: {question}
+
+Retrieved context (top results):
+{context}
+
+Can this context answer the question, either directly or through reasonable inference?
+
+Answer YES if:
+- A specific answer can be extracted or inferred (even if worded differently)
+- A quantity, frequency, or range is stated (e.g., "once or twice a year" answers "how many times")
+- The answer requires combining information from the results but IS present
+
+Answer NO only if:
+- The specific information asked about is genuinely MISSING (e.g., "moved from home country" without naming which country)
+- Results are topically related but don't contain the actual answer
+
+Reply with ONLY "YES" or "NO"."""
+
+    def _llm_check_sufficiency(
+        self, query: str, top_results: list[RetrievalResult]
+    ) -> float | None:
+        """Ask LLM if results actually contain the answer.
+
+        Returns overridden score (0.3 to force rewrite) or None to keep heuristic.
+        """
+        context_lines = []
+        for i, r in enumerate(top_results[:5], 1):
+            content = r.scoring_content[:300].replace("\n", " ")
+            context_lines.append(f"{i}. {content}")
+        context_str = "\n".join(context_lines)
+
+        prompt = self._LLM_SUFFICIENCY_PROMPT.format(
+            question=query, context=context_str
+        )
+
+        try:
+            resp = self.llm_client.chat.completions.create(
+                **llm_chat_kwargs(self.config.llm_reranker_model, max_tokens=10, temperature=0.0),
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = (resp.choices[0].message.content or "").strip().upper()
+            if answer.startswith("NO"):
+                logger.debug("LLM sufficiency check: NO — overriding to 0.3")
+                return 0.3
+        except Exception as e:
+            logger.warning("LLM sufficiency check failed: %s", e)
+
+        return None  # Keep heuristic score
+
+    # --- LLM query rewriting ---
+
+    _LLM_REWRITE_PROMPT = """Question: {question}
+
+Current retrieval results (don't fully answer the question):
+{results}
+
+Previous queries tried: {previous_queries}
+
+Look at the current results for UNRESOLVED REFERENCES — vague terms like "home country", "that place", "the event", "my friend" that need to be resolved to answer the question. Generate a search query to find the missing specific detail.
+
+Examples:
+- Results say "moved from my home country" but don't name it → search: "Caroline country origin Sweden Norway homeland"
+- Results say "went to that concert" but don't say which → search: "Caroline concert band artist event"
+- Results say "her friend helped" but don't name them → search: "Caroline friend name helped"
+
+Rules:
+- Output ONLY the search query, nothing else
+- Use SYNONYMS for key nouns (children → kids, son, daughter)
+- Keep it SHORT (under 10 words)
+
+QUERY:"""
+
+    def _llm_rewrite_query(
+        self,
+        query: str,
+        previous_queries: list[str],
+        current_results: list[RetrievalResult],
+    ) -> str | None:
+        """Use LLM to generate a search query targeting missing information."""
+        result_lines = []
+        for i, r in enumerate(current_results[:5], 1):
+            content = r.content[:200].replace("\n", " ")
+            result_lines.append(f"{i}. {content}")
+        results_str = "\n".join(result_lines) if result_lines else "(no results)"
+
+        prev_str = "\n".join(f"- {q}" for q in previous_queries)
+
+        prompt = self._LLM_REWRITE_PROMPT.format(
+            question=query,
+            results=results_str,
+            previous_queries=prev_str,
+        )
+
+        try:
+            resp = self.llm_client.chat.completions.create(
+                **llm_chat_kwargs(self.llm_model, max_tokens=60, temperature=0.3),
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+
+            # The prompt ends with "QUERY:" so the response should be the query directly.
+            # But if the model prefixes with "QUERY:" again, strip it.
+            rewrite = raw.split("\n")[0].strip()
+            if rewrite.upper().startswith("QUERY:"):
+                rewrite = rewrite[len("QUERY:"):].strip()
+
+            if rewrite and rewrite not in previous_queries and len(rewrite) > 3:
+                logger.debug("LLM query rewrite: %r -> %r", query, rewrite)
+                return rewrite
+        except Exception as e:
+            logger.warning("LLM query rewrite failed: %s", e)
+
+        return None
+
+    # --- LLM BM25 relevance filter (pre-RRF) ---
+
+    _LLM_BM25_FILTER_PROMPT = """Given the question, decide which messages are relevant.
+A message is relevant if it contains information that could help answer the question.
+A message is NOT relevant if it only shares common words with the question by coincidence.
+
+Question: {question}
+
+Messages:
+{messages}
+
+Return ONLY the numbers of relevant messages, comma-separated. Example: 1,3,5
+If none are relevant, return: NONE"""
+
+    def _llm_filter_bm25(
+        self,
+        query: str,
+        results: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Filter BM25 results to remove keyword-matching noise before RRF."""
+        if not self.llm_client or not results:
+            return results
+
+        # Build message list
+        msg_lines = []
+        for i, r in enumerate(results, 1):
+            speaker = r.metadata.get("speaker", "")
+            content = r.content[:150].replace("\n", " ")
+            msg_lines.append(f"{i}. [{speaker}]: {content}")
+
+        prompt = self._LLM_BM25_FILTER_PROMPT.format(
+            question=query,
+            messages="\n".join(msg_lines),
+        )
+
+        try:
+            resp = self.llm_client.chat.completions.create(
+                **llm_chat_kwargs(self.config.llm_reranker_model, max_tokens=100, temperature=0.0),
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+
+            if raw.upper() == "NONE":
+                return []
+
+            # Parse comma-separated indices
+            kept_indices = set()
+            for part in raw.replace(" ", "").split(","):
+                try:
+                    idx = int(part)
+                    if 1 <= idx <= len(results):
+                        kept_indices.add(idx - 1)
+                except ValueError:
+                    continue
+
+            if kept_indices:
+                filtered = [results[i] for i in sorted(kept_indices)]
+                logger.debug(
+                    "BM25 LLM filter: %d -> %d results",
+                    len(results), len(filtered),
+                )
+                return filtered
+
+        except Exception as e:
+            logger.warning("BM25 LLM filter failed: %s", e)
+
+        return results  # Return unfiltered on failure
 
     def _deduplicate(self, results: list[RetrievalResult]) -> list[RetrievalResult]:
         """Remove duplicate results."""
@@ -1132,8 +2084,10 @@ class Retriever:
             return ""
 
         if not self.config.use_position_aware_composition:
-            # Simple composition
-            return "\n\n".join(r.content for r in results[: self.config.top_k])
+            # Simple composition — still include speaker/timestamp metadata
+            return "\n\n".join(
+                self._format_result_content(r) for r in results[: self.config.top_k]
+            )
 
         # Determine if this is a preference/adversarial question
         query_lower = analysis.original_query.lower()
@@ -1200,8 +2154,8 @@ class Retriever:
                 parts.append("\n## Supporting Context")
                 for r in middle:
                     content = self._format_result_content(r)
-                    # Truncate middle content slightly to save space
-                    parts.append(f"- {content[:250]}")
+                    # Truncate middle content to save space
+                    parts.append(f"- {content[:400]}")
 
             if end_priority:
                 parts.append("\n## Additional Key Facts")
@@ -1219,8 +2173,8 @@ class Retriever:
         remaining = non_negation_results[max_results + 5 :]
         if remaining:
             parts.append("\n## More Context")
-            for i, r in enumerate(remaining[:3], 1):
-                content = self._format_result_content(r)[:200]
+            for i, r in enumerate(remaining[:5], 1):
+                content = self._format_result_content(r)[:500]
                 parts.append(f"[{i}] {content}")
 
         # For NON-preference factual questions, only include
@@ -1253,7 +2207,7 @@ class Retriever:
                 parts.append("\n## Timeline")
                 for r in sorted(temporal_results, key=lambda x: x.timestamp or "")[:5]:
                     if r.timestamp:
-                        parts.append(f"- [{r.timestamp}] {r.content[:100]}")
+                        parts.append(f"- [{r.timestamp}] {r.content[:200]}")
 
         context = "\n".join(parts)
 
@@ -1305,3 +2259,136 @@ class Retriever:
 
         response = self.retrieve(question, context=context)
         return response.composed_context
+
+    def trace_retrieval(
+        self,
+        query: str,
+        target_keywords: list[str],
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Diagnostic: trace where messages containing target keywords appear
+        at each pipeline stage.
+
+        Returns a dict with per-stage information showing which candidates
+        contain the target keywords and their ranks/scores.
+        """
+        analysis = self.query_analyzer.analyze(query, context)
+        strategy = self.query_analyzer.get_retrieval_strategy(analysis)
+
+        # Stage 1: per-strategy results (pre-RRF)
+        query_embedding = self._embedding_fn(query) if self._embedding_fn else None
+        strategy_results: dict[str, list[RetrievalResult]] = {}
+
+        if query_embedding is not None:
+            strategy_results["semantic"] = self._semantic_search(
+                query_embedding, strategy.get("top_k", 30)
+            )
+        if strategy.get("use_entity_search") and analysis.entities:
+            strategy_results["entity"] = self._entity_search(analysis.entities)
+        if strategy.get("use_temporal_search"):
+            strategy_results["temporal"] = self._temporal_search(analysis)
+        if strategy.get("use_graph_traversal"):
+            strategy_results["graph"] = self._graph_traversal(
+                analysis, query_embedding, max_hops=2
+            )
+        strategy_results["fact"] = self._fact_search(query_embedding, analysis)
+        strategy_results["working_memory"] = self._working_memory_search(query_embedding)
+        if self.config.use_bm25 and self.memory.bm25 is not None:
+            strategy_results["bm25"] = self._bm25_search(
+                query, top_k=strategy.get("top_k", 30), analysis=analysis
+            )
+        if self.config.use_hierarchical_search:
+            self._ensure_hierarchical_index()
+        if self._hierarchical_search:
+            strategy_results["hierarchical"] = self._hierarchical_search.search(
+                query, query_embedding, analysis, top_k=20
+            )
+
+        def _find_matches(results: list[RetrievalResult]) -> list[dict]:
+            matches = []
+            for rank, r in enumerate(sorted(results, key=lambda x: x.score, reverse=True)):
+                content_lower = r.content.lower()
+                if any(kw.lower() in content_lower for kw in target_keywords):
+                    matches.append({
+                        "rank": rank,
+                        "score": round(r.score, 4),
+                        "source": r.source,
+                        "id": r.id,
+                        "content": r.content[:120],
+                    })
+            return matches
+
+        trace: dict[str, Any] = {"query": query, "target_keywords": target_keywords}
+
+        # Per-strategy matches
+        trace["per_strategy"] = {}
+        for name, results in strategy_results.items():
+            matches = _find_matches(results)
+            trace["per_strategy"][name] = {
+                "total": len(results),
+                "matches": matches,
+            }
+
+        # Stage 2: after RRF
+        if self.config.use_rrf:
+            post_rrf = self._rrf_fusion(strategy_results, analysis)
+        else:
+            post_rrf = []
+            for r in strategy_results.values():
+                post_rrf.extend(r)
+        trace["post_rrf"] = {
+            "total": len(post_rrf),
+            "matches": _find_matches(post_rrf),
+        }
+
+        # Stage 3: after entity scoring
+        target_entity = analysis.target_entity
+        post_entity = list(post_rrf)
+        if target_entity and self.entity_scorer:
+            post_entity = self._apply_entity_scoring(
+                post_entity, target_entity, analysis, query
+            )
+            if not post_entity:
+                post_entity = list(post_rrf)
+        trace["post_entity_scoring"] = {
+            "total": len(post_entity),
+            "matches": _find_matches(post_entity),
+        }
+
+        # Stage 4: after cross-encoder reranking
+        post_rerank = list(post_entity)
+        if self.reranker and self.config.use_reranker:
+            post_rerank = self._apply_reranker(query, post_rerank)
+        trace["post_cross_encoder"] = {
+            "total": len(post_rerank),
+            "matches": _find_matches(post_rerank),
+        }
+
+        # Stage 5: after LLM reranking
+        post_llm = list(post_rerank)
+        if self.llm_client and self.config.use_llm_reranker:
+            post_llm = self._llm_rerank(query, post_llm, analysis)
+        trace["post_llm_rerank"] = {
+            "total": len(post_llm),
+            "matches": _find_matches(post_llm),
+        }
+
+        # Stage 6: after attention filter
+        post_attn = list(post_llm)
+        if self.attention_filter and self.config.use_attention_filter:
+            post_attn = self.attention_filter.filter_context(
+                query, post_attn, query_analysis=analysis
+            )
+        trace["post_attention_filter"] = {
+            "total": len(post_attn),
+            "matches": _find_matches(post_attn),
+        }
+
+        # Stage 7: final context (top_k)
+        final = post_attn[: self.config.top_k]
+        trace["final_top_k"] = {
+            "total": len(final),
+            "matches": _find_matches(final),
+        }
+
+        return trace

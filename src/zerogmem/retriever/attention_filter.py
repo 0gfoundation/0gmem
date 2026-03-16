@@ -110,7 +110,9 @@ class AttentionFilter:
         for result in results:
             score = result.score  # Start with retrieval score
 
-            content_lower = result.content.lower()
+            # Use scoring_content (proposition text) for relevance matching
+            sc = getattr(result, "scoring_content", result.content)
+            content_lower = sc.lower()
             content_words = set(content_lower.split())
 
             # Boost for entity overlap
@@ -158,7 +160,9 @@ class AttentionFilter:
         for result, score in sorted_results:
             # Get embedding for this result
             try:
-                emb = self._embedding_fn(result.content[:500])  # Limit for efficiency
+                # Use scoring_content (proposition text) for dedup embedding
+                sc = getattr(result, "scoring_content", result.content)
+                emb = self._embedding_fn(sc[:500])  # Limit for efficiency
                 if emb is None:
                     kept.append((result, score))
                     continue

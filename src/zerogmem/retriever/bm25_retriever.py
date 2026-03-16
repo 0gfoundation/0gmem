@@ -310,6 +310,57 @@ class BM25Retriever:
         # Art specific
         "art": ["painting", "painted", "draw", "drawing", "abstract", "canvas", "sculpture"],
         "abstract": ["art", "painting", "painted", "artistic"],
+        # Financial and wealth
+        "financial": ["money", "afford", "expensive", "cost", "job", "work", "salary", "budget"],
+        "wealth": ["money", "rich", "afford", "expensive", "income"],
+        # Religion and spirituality
+        "religious": ["church", "faith", "god", "pray", "spiritual", "belief", "religion"],
+        # Politics
+        "political": ["politics", "office", "vote", "campaign", "government", "party"],
+        # Personality and attributes
+        "personality": ["traits", "character", "person", "friend", "describe"],
+        "attributes": ["traits", "personality", "describe", "qualities"],
+        # Education
+        "degree": ["study", "education", "major", "school", "college", "university"],
+        # Holidays
+        "holiday": ["july", "independence", "christmas", "thanksgiving", "easter", "vacation"],
+        # Mountains and outdoor
+        "mountain": ["hiking", "ski", "climb", "trail", "peak", "summit"],
+        # Music (enhanced)
+        "musical": ["concert", "band", "artist", "performer", "singer", "song", "music", "show"],
+        "concert": ["band", "music", "performer", "artist", "singer", "show", "live"],
+        # Pottery and ceramics
+        "pottery": ["bowl", "cup", "clay", "ceramic", "made", "crafts"],
+        "clay": ["pottery", "bowl", "cup", "ceramic", "made", "crafts"],
+        # Photography
+        "photo": ["picture", "image", "shared", "posted", "camera", "photograph"],
+        "picture": ["photo", "image", "shared", "posted", "camera"],
+        # Self-care and wellness
+        "self-care": ["me-time", "relax", "time for myself", "activities", "routine"],
+        "prioritize": ["important", "balance", "routine", "focus"],
+        # Emotions
+        "excited": ["looking forward", "thrilled", "amazing", "eager", "enthusiastic"],
+        "feel": ["feeling", "felt", "emotion", "amazed", "excited", "nervous", "happy"],
+        "feeling": ["felt", "emotion", "amazed", "excited", "nervous", "happy"],
+        "inspired": ["inspiration", "motivated", "because", "wanted to", "creative"],
+        "motivated": ["journey", "support", "experience", "inspired", "because", "reason"],
+        # Plans and future
+        "plans": ["planning", "going to", "researching", "want to", "hoping to", "future"],
+        # Adoption
+        "adoption": ["adopt", "agencies", "family", "kids", "children", "researching"],
+        # Beach and ocean
+        "beach": ["ocean", "sea", "coast", "shore", "surf", "waves", "sand", "summer"],
+        # Summer
+        "summer": ["plans", "vacation", "season", "warm", "trip"],
+        # Shoes and clothing
+        "shoes": ["running", "new shoes", "bought", "footwear"],
+        # Astronomy
+        "meteor": ["shower", "sky", "stars", "universe", "watching", "awe"],
+        # Dance
+        "dance": ["dancing", "dancer", "contemporary", "ballet", "studio", "performance"],
+        "dancers": ["dance", "dancing", "festival", "performing", "graceful"],
+        # Transition and changes
+        "changes": ["transition", "journey", "body", "accepting", "courage"],
     }
 
     def __init__(self, config: BM25Config | None = None):

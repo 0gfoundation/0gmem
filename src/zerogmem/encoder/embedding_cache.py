@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from zerogmem.defaults import DEFAULT_EMBEDDING_MODEL
 from tenacity import (
     before_sleep_log,
     retry,
@@ -48,7 +50,7 @@ class EmbeddingCacheConfig:
     max_memory_entries: int = 10000
     persist_to_disk: bool = True
     batch_size: int = 100  # Max texts per API call
-    model: str = "text-embedding-3-small"
+    model: str = DEFAULT_EMBEDDING_MODEL
     max_retries: int = 3
 
 
@@ -96,7 +98,7 @@ class EmbeddingCache:
             try:
                 import openai
 
-                self._client = openai.OpenAI()
+                self._client = openai.OpenAI(timeout=60.0)
             except Exception as e:
                 logger.warning("Could not initialize OpenAI client: %s", e)
         return self._client
@@ -154,6 +156,7 @@ class EmbeddingCache:
 
         # Embed uncached texts in batches
         if unique_texts:
+            print(f"    Cache: {len(texts) - len(unique_texts)} hits, {len(unique_texts)} misses ({len(unique_texts)} to embed)")
             new_embeddings = self._batch_embed(unique_texts)
 
             # Store in cache
@@ -193,9 +196,12 @@ class EmbeddingCache:
 
         all_embeddings: list[np.ndarray] = []
         batch_size = self.config.batch_size
+        total_batches = (len(texts) + batch_size - 1) // batch_size
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
+            batch_num = i // batch_size + 1
+            print(f"    Embedding batch {batch_num}/{total_batches} ({len(batch)} texts)...")
 
             try:
                 response = _call_api(batch)
@@ -225,7 +231,7 @@ class EmbeddingCache:
 
         return all_embeddings
 
-    def _random_embedding(self, text: str, dim: int = 1536) -> np.ndarray:
+    def _random_embedding(self, text: str, dim: int = 3072) -> np.ndarray:
         """Generate deterministic random embedding (for testing)."""
         np.random.seed(hash(text) % (2**32))
         return np.random.randn(dim).astype(np.float32)

@@ -38,12 +38,13 @@ logger = logging.getLogger("0gmem-mcp")
 
 from mcp.server.fastmcp import FastMCP
 
+from zerogmem.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL
+
 # Initialize the MCP server
 mcp = FastMCP("0gmem")
 
 # Global state for the memory system
 _memory_manager = None
-_encoder = None
 _retriever = None
 _initialized = False
 _memory_dir = None
@@ -124,7 +125,7 @@ def _build_configs() -> tuple[Any, Any, Any]:
     from zerogmem.retriever.retriever import RetrieverConfig
 
     encoder_config = EncoderConfig(
-        embedding_model=os.environ.get("ZEROGMEM_EMBEDDING_MODEL", "text-embedding-3-small"),
+        embedding_model=os.environ.get("ZEROGMEM_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         max_retries=_env_int("ZEROGMEM_API_MAX_RETRIES", 3),
     )
     memory_config = MemoryConfig(
@@ -192,7 +193,7 @@ def _save_state() -> None:
 
 def _initialize_memory() -> None:
     """Initialize the memory system lazily."""
-    global _memory_manager, _encoder, _retriever, _initialized
+    global _memory_manager, _retriever, _initialized
 
     if _initialized:
         return
@@ -202,30 +203,48 @@ def _initialize_memory() -> None:
     error = False
 
     try:
-        from zerogmem import Encoder, MemoryManager, Retriever
+        from zerogmem import MemoryManager, Retriever
         from zerogmem.persistence import load_memory_state
 
         encoder_config, memory_config, retriever_config = _build_configs()
 
-        # Initialize encoder first (needed for both fresh and restored)
-        _encoder = Encoder(config=encoder_config)
-
-        # Try to load existing memory state
+        # Try to load existing memory state (encoder_config passed through
+        # so the restored manager's internal encoder is configured correctly)
         memory_dir = _get_memory_dir()
-        restored = load_memory_state(memory_dir, _encoder.get_embedding)
+        restored = load_memory_state(
+            memory_dir, encoder_config=encoder_config,
+        )
 
         if restored is not None:
             _memory_manager = restored
             logger.info("Restored memory state from disk")
         else:
-            _memory_manager = MemoryManager(config=memory_config)
-            _memory_manager.set_embedding_function(_encoder.get_embedding)
+            _memory_manager = MemoryManager(
+                config=memory_config, encoder_config=encoder_config,
+            )
             logger.info("Starting with fresh memory state")
 
+        # Enable LLM client if API key is available
+        llm_client = None
+        llm_model = DEFAULT_LLM_MODEL
+        llm_api_key = os.environ.get("OPENAI_API_KEY")
+        if llm_api_key:
+            try:
+                import openai
+
+                llm_client = openai.OpenAI(api_key=llm_api_key)
+                _memory_manager.set_llm_client(llm_client)
+                logger.info("LLM consolidation enabled")
+            except ImportError:
+                logger.info("openai package not available, consolidation disabled")
+
+        embed_fn = _memory_manager.encoder.get_embedding
         _retriever = Retriever(
             _memory_manager,
-            embedding_fn=_encoder.get_embedding,
+            embedding_fn=embed_fn,
             config=retriever_config,
+            llm_client=llm_client,
+            llm_model=llm_model,
         )
 
         # Register atexit handler to save state on shutdown
@@ -705,6 +724,69 @@ async def end_conversation_session() -> str:
 
 
 @mcp.tool()
+async def consolidate_memories() -> str:
+    """Trigger memory consolidation to extract inferred knowledge.
+
+    Runs the LLM-based consolidation process over recent messages to
+    discover implicit facts, relationships, and patterns. Requires
+    OPENAI_API_KEY to be set.
+
+    Returns:
+        Summary of newly inferred knowledge
+    """
+    async with _lock:
+        t0 = time.monotonic()
+        error = False
+        try:
+            _ensure_session()
+            assert _memory_manager is not None
+
+            if _memory_manager.consolidator is None:
+                return (
+                    "Consolidation is not available. "
+                    "Set OPENAI_API_KEY environment variable to enable LLM consolidation."
+                )
+
+            # Consolidate recent messages
+            recent_ids = list(_memory_manager._recent_message_ids)
+            if not recent_ids:
+                # Fall back to last N memories
+                all_ids = list(_memory_manager.graph.memories.keys())
+                recent_ids = all_ids[-_memory_manager.consolidator.config.max_context_messages :]
+
+            if not recent_ids:
+                return "No messages available for consolidation."
+
+            created = _memory_manager.consolidator.consolidate(recent_ids)
+            _memory_manager._recent_message_ids.clear()
+
+            if not created:
+                return "Consolidation complete. No new inferences generated."
+
+            # Format results
+            hypotheses = _memory_manager.consolidator.get_hypotheses(min_confidence=0.1)
+            recent = [h for h in hypotheses if h["id"] in created]
+
+            parts = [f"Consolidation complete. Generated {len(created)} new inferences:"]
+            for h in recent:
+                parts.append(f"  - {h['content']} (confidence: {h['confidence']:.2f})")
+
+            # Save state after consolidation
+            _save_state()
+
+            logger.info(f"Manual consolidation produced {len(created)} hypotheses")
+            return "\n".join(parts)
+
+        except Exception as e:
+            error = True
+            logger.error(f"Error during consolidation: {e}")
+            return f"Error during consolidation: {str(e)}"
+        finally:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            _metrics.record("consolidate", elapsed_ms, error=error)
+
+
+@mcp.tool()
 async def start_new_session(topic: str | None = None) -> str:
     """Start a new conversation session.
 
@@ -767,20 +849,35 @@ async def clear_all_memories() -> str:
         t0 = time.monotonic()
         error = False
         try:
-            global _memory_manager, _encoder, _retriever, _initialized
+            global _memory_manager, _retriever, _initialized
 
             # Reset the memory system with env-var configs
-            from zerogmem import Encoder, MemoryManager, Retriever
+            from zerogmem import MemoryManager, Retriever
 
             encoder_config, memory_config, retriever_config = _build_configs()
 
-            _encoder = Encoder(config=encoder_config)
-            _memory_manager = MemoryManager(config=memory_config)
-            _memory_manager.set_embedding_function(_encoder.get_embedding)
+            _memory_manager = MemoryManager(
+                config=memory_config, encoder_config=encoder_config,
+            )
+
+            # Restore LLM client if available
+            llm_client = None
+            llm_api_key = os.environ.get("OPENAI_API_KEY")
+            if llm_api_key:
+                try:
+                    import openai
+                    llm_client = openai.OpenAI(api_key=llm_api_key)
+                    _memory_manager.set_llm_client(llm_client)
+                except ImportError:
+                    pass
+
+            embed_fn = _memory_manager.encoder.get_embedding
             _retriever = Retriever(
                 _memory_manager,
-                embedding_fn=_encoder.get_embedding,
+                embedding_fn=embed_fn,
                 config=retriever_config,
+                llm_client=llm_client,
+                llm_model=DEFAULT_LLM_MODEL,
             )
 
             # Clear any persisted state files
@@ -800,6 +897,69 @@ async def clear_all_memories() -> str:
         finally:
             elapsed_ms = (time.monotonic() - t0) * 1000
             _metrics.record("clear_all", elapsed_ms, error=error)
+
+
+@mcp.tool()
+async def ask_question(
+    query: str,
+) -> str:
+    """Ask a question about stored memories and get a generated answer.
+
+    Uses retrieved context and LLM to generate a direct answer. Supports
+    question-type-aware prompting, entity verification, and answer
+    normalization for counting, yes/no, temporal, and multi-hop questions.
+
+    Args:
+        query: The question to ask (e.g., "What is Alice's favorite hobby?")
+
+    Returns:
+        Generated answer based on stored memories
+    """
+    async with _lock:
+        err = _validate_string(query, "query", MAX_QUERY_LENGTH)
+        if err:
+            return err
+
+        t0 = time.monotonic()
+        error = False
+        try:
+            _ensure_session()
+            assert _retriever is not None
+            assert _memory_manager is not None
+
+            if not _retriever.llm_client:
+                # No LLM — return context only
+                result = _retriever.retrieve(query)
+                if not result.composed_context or result.composed_context.strip() == "":
+                    return "No relevant memories found to answer this question."
+                return (
+                    f"## Context for: {query}\n\n{result.composed_context}\n\n"
+                    "---\n*No LLM client available for answer generation. "
+                    "Set OPENAI_API_KEY to enable.*"
+                )
+
+            answer, metadata = _retriever.answer(query)
+
+            if not metadata.get("context", "").strip():
+                return "No relevant memories found to answer this question."
+
+            response_parts = [answer]
+            if metadata.get("was_evasive"):
+                response_parts.append("\n*Note: Initial retrieval was uncertain.*")
+
+            logger.info(
+                f"Answered question: {query[:50]}... -> {answer[:50]}... "
+                f"(type={metadata.get('question_type')})"
+            )
+            return "\n".join(response_parts)
+
+        except Exception as e:
+            error = True
+            logger.error(f"Error answering question: {e}")
+            return f"Error answering question: {str(e)}"
+        finally:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            _metrics.record("ask_question", elapsed_ms, error=error)
 
 
 @mcp.tool()
@@ -896,13 +1056,15 @@ async def import_memory(archive_path: str, merge: bool = False) -> str:
         error = False
         try:
             _initialize_memory()
-            assert _encoder is not None
 
             from zerogmem.persistence import import_memory_archive, save_memory_state
 
             global _memory_manager, _retriever
 
-            restored = import_memory_archive(archive_path, _encoder.get_embedding)
+            encoder_config, _, retriever_config = _build_configs()
+            restored = import_memory_archive(
+                archive_path, encoder_config=encoder_config,
+            )
             if restored is None:
                 return (
                     "Error: Failed to import archive. Check that the file is a valid 0GMem export."
@@ -914,11 +1076,14 @@ async def import_memory(archive_path: str, merge: bool = False) -> str:
             # Re-create retriever with new manager
             from zerogmem import Retriever
 
-            _, _, retriever_config = _build_configs()
+            llm_client = getattr(_memory_manager, "_llm_client", None)
+            embed_fn = _memory_manager.encoder.get_embedding
             _retriever = Retriever(
                 _memory_manager,
-                embedding_fn=_encoder.get_embedding,
+                embedding_fn=embed_fn,
                 config=retriever_config,
+                llm_client=llm_client,
+                llm_model=DEFAULT_LLM_MODEL,
             )
 
             # Save imported state to data dir

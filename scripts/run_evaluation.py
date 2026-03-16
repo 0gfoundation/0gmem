@@ -73,23 +73,13 @@ def main():
     parser.add_argument(
         "--llm-model",
         type=str,
-        default=os.getenv("OPENAI_MODEL") or os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini",
+        default=os.getenv("OPENAI_MODEL") or os.getenv("OPENAI_CHAT_MODEL") or "gpt-5.2",
         help="Chat model to use for LLM calls"
-    )
-    parser.add_argument(
-        "--use-evidence-reranker",
-        action="store_true",
-        help="Use LLM to rerank evidence context before answering"
-    )
-    parser.add_argument(
-        "--no-evidence-reranker",
-        action="store_true",
-        help="Disable evidence reranking"
     )
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default="text-embedding-3-small",
+        default="text-embedding-3-large",
         help="Embedding model to use"
     )
     parser.add_argument(
@@ -113,6 +103,16 @@ def main():
         "--no-bm25",
         action="store_true",
         help="Disable BM25 hybrid search"
+    )
+    parser.add_argument(
+        "--use-consolidation",
+        action="store_true",
+        help="Enable LLM-based memory consolidation during ingestion"
+    )
+    parser.add_argument(
+        "--use-retrieval-reasoning",
+        action="store_true",
+        help="Enable LLM-based retrieval-time reasoning for weak results"
     )
     parser.add_argument(
         "--use-reranker",
@@ -168,31 +168,31 @@ def main():
     # Configure components
     memory_config = MemoryConfig(
         working_memory_capacity=30,
-        embedding_dim=1536,
-        auto_consolidate=True,
+        embedding_dim=3072,
+        auto_consolidate=args.use_consolidation,
     )
 
     encoder_config = EncoderConfig(
         embedding_model=args.embedding_model,
-        embedding_dim=1536,
+        embedding_dim=3072,
     )
 
-    retriever_config = RetrieverConfig(
-        top_k=20,  # Increased for better retrieval
-        use_position_aware_composition=True,
-        check_negations=True,
-        use_reranker=args.use_reranker,
-        rerank_top_n=args.rerank_top_n,
-        rerank_weight=args.rerank_weight,
-        reranker_model=args.reranker_model,
-    )
+    # Use locomo.py's tuned default RetrieverConfig unless overrides needed
+    retriever_config = None
+    if args.use_reranker or args.use_retrieval_reasoning:
+        retriever_config = RetrieverConfig(
+            use_reranker=args.use_reranker,
+            rerank_top_n=args.rerank_top_n,
+            rerank_weight=args.rerank_weight,
+            reranker_model=args.reranker_model,
+            use_retrieval_reasoning=args.use_retrieval_reasoning,
+        )
 
     # Initialize evaluator with new features
     print("\nInitializing 0GMem evaluator...")
     print(f"  Embedding cache: {'enabled' if use_cache else 'disabled'}")
     print(f"  BM25 hybrid search: {'enabled' if use_bm25 else 'disabled'}")
-
-    use_evidence_reranker = args.use_evidence_reranker and not args.no_evidence_reranker
+    print(f"  Memory consolidation: {'enabled' if args.use_consolidation else 'disabled'}")
 
     evaluator = LoCoMoEvaluator(
         data_path=args.data_path,
@@ -201,9 +201,9 @@ def main():
         retriever_config=retriever_config,
         llm_client=llm_client,
         llm_model=args.llm_model,
-        use_evidence_reranker=use_evidence_reranker,
         use_cache=use_cache,
         use_bm25=use_bm25,
+        use_consolidation=args.use_consolidation,
     )
 
     # Load dataset

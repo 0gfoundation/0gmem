@@ -38,7 +38,7 @@ Most AI memory systems treat memories as flat text chunks in a vector store — 
 | Negation handling | None | None | None | **First-class negation storage and retrieval** |
 | Multi-hop reasoning | Single retrieval | Entity traversal | Agent decides | **Simultaneous BFS across entity, temporal, and semantic graphs** |
 | Context quality | Top-k similarity | Top-k similarity | Agent-selected | **Attention-filtered with redundancy removal and diversity enforcement** |
-| LoCoMo accuracy | 66.9–68.5% | 58–75% | 48–74% | **80.4–95.6%** |
+| LoCoMo accuracy | 66.9–68.5% | 58–75% | 48–74% | **85.6–96.6%** |
 
 ## Key Innovations
 
@@ -107,27 +107,68 @@ result = retriever.retrieve("When did Alice visit the Alps?")
 print(result.composed_context)
 ```
 
-## Claude Code Integration
+## MCP Integration
 
-0GMem can be used as an MCP server to give Claude Code persistent, intelligent memory:
+0GMem ships as an [MCP](https://modelcontextprotocol.io/) server, so any MCP-compatible client can use it as a persistent, structured memory backend.
+
+### Claude Code
 
 ```bash
-# Install and add to Claude Code
+# Install
 pip install -e .
 python -m spacy download en_core_web_sm
+
+# Add the MCP server
 claude mcp add --transport stdio 0gmem -- python -m zerogmem.mcp_server
 
 # Verify
 claude mcp list
 ```
 
-Once configured, Claude Code gains access to memory tools:
-- `store_memory` - Remember important information
-- `retrieve_memories` - Recall relevant context
-- `search_memories_by_entity` - Find info about people/places/things
-- `search_memories_by_time` - Find memories from specific times
+### OpenClaw
 
-See [docs/MCP_SERVER.md](docs/MCP_SERVER.md) for detailed setup and usage.
+Add 0GMem to your `openclaw.json` (or use `openclaw config set`):
+
+```json
+{
+  "mcpServers": {
+    "0gmem": {
+      "command": "python",
+      "args": ["-m", "zerogmem.mcp_server"],
+      "env": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+### Other MCP Clients
+
+Any client that supports stdio transport can use 0GMem. The server command is:
+
+```bash
+python -m zerogmem.mcp_server
+```
+
+Pass `--data-dir /path/to/data` to customize the storage location (default: `~/.0gmem`).
+
+### Available Tools
+
+Once connected, the client gains access to:
+
+| Tool | Description |
+|------|-------------|
+| `store_memory` | Store a conversation message or fact |
+| `retrieve_memories` | Semantic search over past interactions |
+| `search_memories_by_entity` | Find all memories about a person/place/thing |
+| `search_memories_by_time` | Find memories from a specific time period |
+| `get_memory_summary` | Get statistics about stored memories |
+| `start_new_session` / `end_conversation_session` | Session lifecycle management |
+| `export_memory` / `import_memory` | Portable backup and restore |
+| `clear_all_memories` | Reset all stored memories |
+
+See [docs/MCP_SERVER.md](docs/MCP_SERVER.md) for detailed configuration options and usage examples.
 
 ## API Reference
 
@@ -207,29 +248,28 @@ python scripts/run_evaluation.py --data-path data/locomo/sample_locomo.json --us
 
 ### LoCoMo Benchmark Results
 
-The [LoCoMo benchmark](https://snap-research.github.io/locomo/) evaluates long-term conversational memory across multi-session dialogues.
+The [LoCoMo benchmark](https://snap-research.github.io/locomo/) evaluates long-term conversational memory across multi-session dialogues with 1,986 questions spanning factual recall, temporal reasoning, multi-hop inference, yes/no, adversarial, and counting question types.
 
 **0GMem Results:**
 
-| Subset | Accuracy |
-|--------|----------|
-| 3-conversation | 95.57% |
-| 10-conversation | 80.41% |
+| Subset | Accuracy | Questions |
+|--------|----------|-----------|
+| 3-conversation | 96.58% | 585/605 |
+| 10-conversation | 85.60% | 1,700/1,986 |
 
 ### Comparison with Other Systems
 
-Based on published results from various sources:
-
-| System | Score | Notes |
-|--------|-------|-------|
+| System | 10-conv Score | Notes |
+|--------|---------------|-------|
+| **0GMem** | **85.60%** | **Structured memory with multi-graph retrieval** |
 | Human Performance | 87.9 F1 | Upper bound ([LoCoMo Paper](https://arxiv.org/abs/2402.17753)) |
-| GPT-4-turbo (4K) | ~32 F1 | Baseline LLM |
-| GPT-3.5-turbo-16K | 37.8 F1 | Extended context window |
-| Best RAG Baseline | 41.4 F1 | Retrieval-augmented generation |
-| MemGPT/Letta | 48-74% | Varies by configuration ([Letta Blog](https://www.letta.com/blog/benchmarking-ai-agent-memory)) |
+| Mem0 | 66.9–68.5% | Graph-enhanced variant ([Mem0 Research](https://mem0.ai/research)) |
+| Zep | 58–75% | Results disputed across studies |
 | OpenAI Memory | 52.9% | Built-in memory feature |
-| Zep | 58-75% | Results disputed across studies |
-| Mem0 | 66.9-68.5% | Graph-enhanced variant ([Mem0 Research](https://mem0.ai/research)) |
+| MemGPT/Letta | 48–74% | Varies by configuration ([Letta Blog](https://www.letta.com/blog/benchmarking-ai-agent-memory)) |
+| Best RAG Baseline | 41.4 F1 | Retrieval-augmented generation |
+| GPT-3.5-turbo-16K | 37.8 F1 | Extended context window |
+| GPT-4-turbo (4K) | ~32 F1 | Baseline LLM |
 
 *Note: Metrics vary across studies (F1 vs accuracy, different evaluation protocols). Direct comparisons should be interpreted with caution.*
 

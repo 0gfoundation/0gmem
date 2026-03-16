@@ -10,12 +10,10 @@ Key innovations:
 - Position-aware composition to combat "lost-in-the-middle"
 
 Quick Start:
-    from zerogmem import MemoryManager, Encoder, Retriever
+    from zerogmem import MemoryManager, Retriever
 
-    memory = MemoryManager()
-    encoder = Encoder()
-    memory.set_embedding_function(encoder.get_embedding)
-    retriever = Retriever(memory, embedding_fn=encoder.get_embedding)
+    memory = MemoryManager()  # Internal encoder auto-created
+    retriever = Retriever(memory, embedding_fn=memory.encoder.get_embedding)
 
     memory.start_session()
     memory.add_message("Alice", "I love hiking in the mountains.")
@@ -31,6 +29,10 @@ __author__ = "0G Labs"
 from zerogmem.encoder.encoder import Encoder, EncoderConfig
 from zerogmem.memory.manager import MemoryConfig, MemoryManager
 from zerogmem.persistence import load_memory_state, save_memory_state
+from zerogmem.reasoning.answer_generator import AnswerConfig, AnswerGenerator
+from zerogmem.reasoning.counting import CountingConfig, CountingPipeline
+from zerogmem.reasoning.prompt_templates import PromptTemplates, QuestionType
+from zerogmem.retriever.entity_scorer import EntityScorer, EntityScoringConfig
 from zerogmem.retriever.query_analyzer import QueryAnalysis, QueryAnalyzer
 from zerogmem.retriever.retriever import (
     RetrievalResponse,
@@ -53,6 +55,16 @@ __all__ = [
     "RetrievalResponse",
     "QueryAnalysis",
     "QueryAnalyzer",
+    # Reasoning
+    "AnswerGenerator",
+    "AnswerConfig",
+    "PromptTemplates",
+    "QuestionType",
+    "CountingPipeline",
+    "CountingConfig",
+    # Entity scoring
+    "EntityScorer",
+    "EntityScoringConfig",
     # Persistence
     "save_memory_state",
     "load_memory_state",

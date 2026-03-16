@@ -74,7 +74,7 @@ class SemanticGraph:
         "example_of",  # Instance relation
     ]
 
-    def __init__(self, embedding_dim: int = 1536):
+    def __init__(self, embedding_dim: int = 3072):
         self.graph = nx.Graph()  # Undirected for semantic similarity
         self.nodes: dict[str, SemanticNode] = {}
         self.edges: list[SemanticEdge] = []
@@ -304,7 +304,7 @@ class SemanticGraph:
             embeddings_map: Map of node_id -> np.ndarray embeddings.
         """
         embeddings_map = embeddings_map or {}
-        graph = cls(embedding_dim=data.get("embedding_dim", 1536))
+        graph = cls(embedding_dim=data.get("embedding_dim", 3072))
 
         for nd in data.get("nodes", []):
             node = SemanticNode(

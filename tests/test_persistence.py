@@ -240,7 +240,8 @@ class TestSaveLoadMemoryState:
         save_memory_state(populated_manager, tmp_persist_dir)
         restored = load_memory_state(tmp_persist_dir)
         assert restored is not None
-        assert restored._embed_fn is None
+        # Internal encoder provides a default embedding function
+        assert restored._embed_fn is not None
 
     def test_round_trip_temporal_nodes(self, populated_manager, mock_embedding_fn, tmp_persist_dir):
         save_memory_state(populated_manager, tmp_persist_dir)

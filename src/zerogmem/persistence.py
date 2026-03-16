@@ -200,6 +200,7 @@ def save_memory_state(manager: MemoryManager, path: str | Path) -> dict[str, Any
 def load_memory_state(
     path: str | Path,
     embedding_fn: Callable[..., Any] | None = None,
+    encoder_config: Any | None = None,
 ) -> MemoryManager | None:
     """Load memory state from disk.
 
@@ -212,6 +213,7 @@ def load_memory_state(
     Args:
         path: Directory path containing state files.
         embedding_fn: Embedding function to set on restored manager.
+        encoder_config: Optional EncoderConfig for the internal encoder.
 
     Returns:
         Restored MemoryManager, or None if no valid state file exists.
@@ -292,7 +294,7 @@ def load_memory_state(
 
     # --- Step 3: Deserialize (guard against malformed JSON structure) ---
     try:
-        manager = MemoryManager.from_dict(state, embedding_fn, embeddings_map)
+        manager = MemoryManager.from_dict(state, embedding_fn, embeddings_map, encoder_config)
     except Exception as e:
         logger.warning(
             f"Failed to deserialize state from {source_label} file: {e}. "
@@ -387,12 +389,14 @@ def export_memory_archive(
 def import_memory_archive(
     archive_path: str | Path,
     embedding_fn: Callable[..., Any] | None = None,
+    encoder_config: Any | None = None,
 ) -> MemoryManager | None:
     """Import memory state from a ZIP archive.
 
     Args:
         archive_path: Path to the .zip archive.
         embedding_fn: Embedding function to set on restored manager.
+        encoder_config: Optional EncoderConfig for the internal encoder.
 
     Returns:
         Restored MemoryManager, or None on failure.
@@ -433,7 +437,7 @@ def import_memory_archive(
         tmp_dir = tempfile.mkdtemp(prefix="0gmem_import_")
         try:
             zf.extractall(tmp_dir)
-            manager = load_memory_state(tmp_dir, embedding_fn)
+            manager = load_memory_state(tmp_dir, embedding_fn, encoder_config)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -121,6 +121,30 @@ class FactExtractor:
             "came from",
             FactType.LOCATION,
         ),
+        # Appositive origin: "my home country, Sweden"
+        (
+            r"(?:my|his|her|their|(\w+)'s)\s+home\s+(?:country|town|city|village)[,]?\s+([A-Z]\w+(?:\s+[A-Z]\w+)?)",
+            "is from",
+            FactType.LOCATION,
+        ),
+        # "originally from X"
+        (
+            r"(?:i|he|she|they|(\w+))\s+(?:am|is|are|was|were)\s+originally\s+from\s+(\w+(?:\s+\w+)?)",
+            "originally from",
+            FactType.LOCATION,
+        ),
+        # "born in X"
+        (
+            r"(?:i|he|she|they|(\w+))\s+(?:was|were)\s+born\s+in\s+(\w+(?:\s+\w+)?)",
+            "born in",
+            FactType.LOCATION,
+        ),
+        # "back in my country, X"
+        (
+            r"(?:back\s+)?in\s+(?:my|his|her|their|(\w+)'s)\s+(?:home\s+)?country[,]?\s+([A-Z]\w+(?:\s+[A-Z]\w+)?)",
+            "is from",
+            FactType.LOCATION,
+        ),
         # Status patterns
         (
             r"(?:i|he|she|they|(\w+))\s+"

@@ -16,6 +16,8 @@ import json
 import re
 from typing import Any
 
+from zerogmem.defaults import DEFAULT_LLM_MODEL, llm_chat_kwargs
+
 from .memcell import CellType, MemCell, MemoryStore, MemScene, SceneType
 
 
@@ -158,14 +160,16 @@ class MemCellExtractor:
         (r"on (\d{1,2}\s+\w+(?:,?\s+\d{4})?)", "on_date"),
     ]
 
-    def __init__(self, llm_client: Any | None = None) -> None:
+    def __init__(self, llm_client: Any | None = None, llm_model: str = DEFAULT_LLM_MODEL) -> None:
         """
         Initialize the extractor.
 
         Args:
             llm_client: Optional OpenAI client for LLM-based extraction
+            llm_model: LLM model name for API calls
         """
         self.llm_client = llm_client
+        self.llm_model = llm_model
         self.memory_store = MemoryStore()
 
     def extract_from_message(
@@ -597,10 +601,8 @@ JSON:"""
 
         try:
             response = self.llm_client.chat.completions.create(
-                model="gpt-4o-mini",
+                **llm_chat_kwargs(self.llm_model, max_tokens=500, temperature=0),
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0,
             )
 
             result = response.choices[0].message.content.strip()
@@ -661,8 +663,9 @@ class MemSceneBuilder:
     - Related entities
     """
 
-    def __init__(self, llm_client: Any | None = None) -> None:
+    def __init__(self, llm_client: Any | None = None, llm_model: str = DEFAULT_LLM_MODEL) -> None:
         self.llm_client = llm_client
+        self.llm_model = llm_model
         self.scenes: dict[str, MemScene] = {}
 
     def build_scenes(self, cells: list[MemCell], memory_store: MemoryStore) -> list[MemScene]:
@@ -808,10 +811,8 @@ Summary:"""
 
         try:
             response = self.llm_client.chat.completions.create(
-                model="gpt-4o-mini",
+                **llm_chat_kwargs(self.llm_model, max_tokens=100, temperature=0),
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0,
             )
             result: str = response.choices[0].message.content.strip()
             return result

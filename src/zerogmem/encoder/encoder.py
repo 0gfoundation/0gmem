@@ -13,6 +13,8 @@ from datetime import datetime
 from typing import Any
 
 import numpy as np
+
+from zerogmem.defaults import DEFAULT_EMBEDDING_MODEL
 from tenacity import (
     before_sleep_log,
     retry,
@@ -46,8 +48,8 @@ class EncodingResult:
 class EncoderConfig:
     """Configuration for the encoder."""
 
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dim: int = 1536
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_dim: int = 3072
     use_llm_extraction: bool = False
     extract_importance: bool = True
     importance_threshold: float = 0.3
@@ -145,6 +147,7 @@ class Encoder:
         session_id: str | None = None,
         reference_time: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        skip_embedding: bool = False,
     ) -> EncodingResult:
         """
         Encode a text into memory structures.
@@ -182,9 +185,12 @@ class Encoder:
         temporal_expressions = self.temporal_extractor.extract(text)
         temporal_context = self.temporal_extractor.get_temporal_context(temporal_expressions)
 
-        # Generate embedding
-        embed_fn = self._get_embedding_fn()
-        embedding = embed_fn(text)
+        # Generate embedding (skip when caller will supply a pre-computed one)
+        if skip_embedding:
+            embedding = np.zeros(self.config.embedding_dim, dtype=np.float32)
+        else:
+            embed_fn = self._get_embedding_fn()
+            embedding = embed_fn(text)
 
         # Compute importance score
         importance = self._compute_importance(

@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from zerogmem.defaults import DEFAULT_LLM_MODEL, llm_chat_kwargs
+
 
 @dataclass
 class SubQuestion:
@@ -525,7 +527,7 @@ class ReasoningChainExecutor:
         self.answer_fn = answer_fn
         self._client = llm_client
         self._model = (
-            model or os.getenv("OPENAI_MODEL") or os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini"
+            model or DEFAULT_LLM_MODEL
         )
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
@@ -542,10 +544,8 @@ class ReasoningChainExecutor:
         for attempt in range(self._max_retries):
             try:
                 response = self._client.chat.completions.create(
-                    model=self._model,
+                    **llm_chat_kwargs(self._model, max_tokens=max_tokens, temperature=temperature),
                     messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
                 )
                 result: str = response.choices[0].message.content.strip()
                 return result
@@ -623,7 +623,7 @@ Final Answer:"""
             try:
                 synthesis_result = self._chat_completion(
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=150,
+                    max_completion_tokens=150,
                     temperature=0,
                 )
                 if synthesis_result:

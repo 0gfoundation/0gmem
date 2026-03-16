@@ -120,6 +120,8 @@ class TemporalExtractor:
         r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,?\s+\d{4})?",
         r"\d{1,2}/\d{1,2}/\d{2,4}",
         r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}",
+        # DD FullMonth, YYYY (e.g., "3 June, 2023")
+        r"\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December),?\s+\d{4}",
         # Times
         r"\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?",
     ]
@@ -319,6 +321,7 @@ class TemporalExtractor:
             "%B %d %Y",
             "%d %B %Y",
             "%d %b %Y",
+            "%d %B, %Y",
             "%m/%d/%Y",
             "%m/%d/%y",
             "%d/%m/%Y",
