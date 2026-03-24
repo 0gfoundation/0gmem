@@ -22,7 +22,7 @@ Quick Start:
     result = retriever.retrieve("What does Alice enjoy?")
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "0G Labs"
 
 # Core classes
@@ -30,7 +30,6 @@ from zerogmem.encoder.encoder import Encoder, EncoderConfig
 from zerogmem.memory.manager import MemoryConfig, MemoryManager
 from zerogmem.persistence import load_memory_state, save_memory_state
 from zerogmem.reasoning.answer_generator import AnswerConfig, AnswerGenerator
-from zerogmem.reasoning.counting import CountingConfig, CountingPipeline
 from zerogmem.reasoning.prompt_templates import PromptTemplates, QuestionType
 from zerogmem.retriever.entity_scorer import EntityScorer, EntityScoringConfig
 from zerogmem.retriever.query_analyzer import QueryAnalysis, QueryAnalyzer
@@ -60,8 +59,6 @@ __all__ = [
     "AnswerConfig",
     "PromptTemplates",
     "QuestionType",
-    "CountingPipeline",
-    "CountingConfig",
     # Entity scoring
     "EntityScorer",
     "EntityScoringConfig",

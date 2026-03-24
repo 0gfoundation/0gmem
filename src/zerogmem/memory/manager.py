@@ -68,6 +68,9 @@ class MemoryConfig:
     use_proposition_index: bool = True
     min_message_length_for_split: int = 80  # chars
     min_proposition_length: int = 20  # chars
+    # Per-chunk LLM fact extraction (extracts fine-grained atomic facts with
+    # pronoun resolution; subsumes regex cross-person trait extraction)
+    use_llm_fact_extraction: bool = False
 
 
 class MemoryManager:
@@ -166,10 +169,17 @@ class MemoryManager:
 
         # Embedding function (to be set by encoder)
         self._embed_fn: Callable[[str], np.ndarray] | None = None
+        # Batch embedding function for efficient bulk operations
+        self._batch_embed_fn: Callable[[list[str]], list[np.ndarray]] | None = None
 
-    def set_embedding_function(self, embed_fn: Callable[[str], np.ndarray]) -> None:
+    def set_embedding_function(
+        self,
+        embed_fn: Callable[[str], np.ndarray],
+        batch_embed_fn: Callable[[list[str]], list[np.ndarray]] | None = None,
+    ) -> None:
         """Set the embedding function for memory encoding."""
         self._embed_fn = embed_fn
+        self._batch_embed_fn = batch_embed_fn
         self.encoder._embedding_fn = embed_fn
 
     def set_llm_client(self, llm_client: Any) -> None:
@@ -200,10 +210,12 @@ class MemoryManager:
                 memory=self,
                 llm_client=llm_client,
                 embed_fn=self._embed_fn,
+                batch_embed_fn=self._batch_embed_fn,
                 config=ChunkConfig(
                     chunk_window_size=self.config.chunk_window_size,
                     llm_model=self.config.chunk_llm_model,
                     enrich_embedding_prefix=self.config.enrich_embeddings,
+                    use_llm_fact_extraction=self.config.use_llm_fact_extraction,
                 ),
             )
 
@@ -539,6 +551,7 @@ class MemoryManager:
                 fact_item = UnifiedMemoryItem(
                     content=fact_content,
                     source="cross_person_trait",
+                    entities=[partner, speaker],
                     entity_names=[partner, speaker],
                     speaker=speaker,
                     session_id=self.current_session_id,

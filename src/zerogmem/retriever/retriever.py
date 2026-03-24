@@ -128,6 +128,9 @@ class RetrieverConfig:
     llm_sufficiency_high: float = 0.85
     # LLM query rewriting (last resort after rule-based strategies)
     use_llm_rewrite: bool = True
+    # Query planner (LLM-driven plan-execute-evaluate loop)
+    use_query_planner: bool = False
+    query_planner_max_rounds: int = 2
 
 
 class Retriever:
@@ -187,6 +190,196 @@ class Retriever:
                 config=filter_config,
                 embedding_fn=self._embedding_fn,
             )
+
+        # Initialize query planner (optional, replaces hardcoded strategy selection)
+        self._query_planner = None
+        if self.config.use_query_planner and self.llm_client:
+            self._query_planner = self._build_query_planner()
+
+    def _build_query_planner(self):
+        """Build the LLM-driven query planner with index adapters."""
+        from zerogmem.retriever.query_planner import (
+            IndexAdapter,
+            IndexDescriptor,
+            IndexRegistry,
+            QueryPlanner,
+        )
+
+        registry = IndexRegistry()
+
+        # --- Adapter factory: each wraps a Retriever strategy method ---
+
+        def _make_semantic_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                top_k = params.get("top_k", 30)
+                if query_embedding is None:
+                    return []
+                return self._semantic_search(query_embedding, top_k)
+            return _execute
+
+        def _make_entity_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                entities = params.get("entities") or (analysis.entities if analysis else [])
+                if not entities:
+                    return []
+                # For list-type queries, default to higher top_k to capture all items
+                default_top_k = 5
+                if analysis and analysis.expected_answer_type == "list":
+                    default_top_k = 25
+                top_k_per_entity = params.get("top_k_per_entity", default_top_k)
+                source_filter = params.get("source_filter")
+                return self._entity_search(
+                    entities,
+                    top_k_per_entity=top_k_per_entity,
+                    source_filter=source_filter,
+                )
+            return _execute
+
+        def _make_temporal_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                if not analysis:
+                    return []
+                return self._temporal_search(analysis)
+            return _execute
+
+        def _make_graph_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                if not analysis:
+                    return []
+                max_hops = params.get("max_hops", 2)
+                return self._graph_traversal(analysis, query_embedding, max_hops)
+            return _execute
+
+        def _make_fact_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                return self._fact_search(query_embedding, analysis)
+            return _execute
+
+        def _make_working_memory_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                return self._working_memory_search(query_embedding)
+            return _execute
+
+        def _make_bm25_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                if self.memory.bm25 is None:
+                    return []
+                top_k = params.get("top_k", 30)
+                results = self._bm25_search(query, top_k, analysis)
+                if self.config.use_llm_bm25_filter and results:
+                    results = self._llm_filter_bm25(query, results)
+                return results
+            return _execute
+
+        def _make_hierarchical_adapter():
+            def _execute(query, query_embedding, analysis, params):
+                self._ensure_hierarchical_index()
+                if self._hierarchical_search is None:
+                    return []
+                top_k = params.get("top_k", 20)
+                return self._hierarchical_search.search(
+                    query, query_embedding, analysis, top_k=top_k,
+                )
+            return _execute
+
+        # --- Register indexes with descriptors ---
+
+        registry.register(
+            IndexDescriptor(
+                name="semantic",
+                description="Dense vector similarity search over all stored messages. "
+                    "Best for finding semantically similar content even when keywords differ",
+                parameters={"top_k": "int, number of results (default 30)"},
+            ),
+            IndexAdapter("semantic", _make_semantic_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="entity",
+                description="Searches the entity relationship graph for memories about "
+                    "specific people, places, or things. Returns messages and entity profiles. "
+                    "Use source_filter to retrieve all memories of a specific type "
+                    "(e.g. 'cross_person_trait' for personality traits, 'llm_chunk_fact' for extracted facts)",
+                parameters={
+                    "entities": "list of entity names to look up (defaults to query entities)",
+                    "top_k_per_entity": "int, max memories per entity (default 5, increase for exhaustive queries)",
+                    "source_filter": "string, filter by source OR metadata category (e.g. 'personality_trait' for traits, 'llm_chunk_fact' for extracted facts)",
+                },
+            ),
+            IndexAdapter("entity", _make_entity_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="temporal",
+                description="Finds memories matching temporal constraints using Allen's interval "
+                    "algebra (BEFORE, AFTER, DURING, etc.). Best for when/date questions",
+                parameters={},
+            ),
+            IndexAdapter("temporal", _make_temporal_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="graph",
+                description="Multi-hop BFS across entity and causal graphs. Follows "
+                    "entity→entity and cause→effect chains. Best for connecting distant facts",
+                parameters={"max_hops": "int, maximum traversal depth (default 2)"},
+            ),
+            IndexAdapter("graph", _make_graph_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="fact",
+                description="Searches extracted semantic facts (subject-predicate-object triples). "
+                    "Best for preferences, attributes, and verified knowledge",
+                parameters={},
+            ),
+            IndexAdapter("fact", _make_fact_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="working_memory",
+                description="Returns recent conversation context with attention-based decay. "
+                    "Best for follow-up questions or references to recent discussion",
+                parameters={},
+            ),
+            IndexAdapter("working_memory", _make_working_memory_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="bm25",
+                description="Sparse keyword search with TF-IDF scoring. Best for exact "
+                    "name/term matching where embeddings may miss specific tokens",
+                parameters={"top_k": "int, number of results (default 30)"},
+                available=self.memory.bm25 is not None and self.config.use_bm25,
+            ),
+            IndexAdapter("bm25", _make_bm25_adapter()),
+        )
+
+        registry.register(
+            IndexDescriptor(
+                name="hierarchical",
+                description="Three-level tree search: session → chunk → message. Best for "
+                    "broad questions or finding the right conversation segment",
+                parameters={"top_k": "int, number of results (default 20)"},
+                available=self.config.use_hierarchical_search,
+            ),
+            IndexAdapter("hierarchical", _make_hierarchical_adapter()),
+        )
+
+        return QueryPlanner(
+            registry=registry,
+            llm_client=self.llm_client,
+            llm_model=self.llm_model,
+            max_rounds=self.config.query_planner_max_rounds,
+            rrf_fn=self._rrf_fusion,
+            rrf_k=self.config.rrf_k,
+        )
 
     def _ensure_hierarchical_index(self) -> None:
         """Build hierarchical index lazily on first retrieval."""
@@ -263,6 +456,7 @@ class Retriever:
             llm_client=self.llm_client,
             config=AnswerConfig(llm_model=self.llm_model),
         )
+
         answer, gen_meta = generator.generate_answer(
             query=query,
             context=context,
@@ -272,6 +466,7 @@ class Retriever:
         gen_meta["context"] = context
         gen_meta["target_entity"] = target_entity
         gen_meta["num_results"] = len(retrieval.results)
+        gen_meta["planner_fallback"] = retrieval.metadata.get("planner_fallback", False)
         return answer, gen_meta
 
     def _single_pass_retrieve(
@@ -353,6 +548,71 @@ class Retriever:
             },
         )
 
+    def _post_process(
+        self,
+        results: list[RetrievalResult],
+        query: str,
+        analysis: QueryAnalysis,
+    ) -> RetrievalResponse:
+        """Shared post-processing: entity scoring → reranking → attention filter → compose."""
+        strategy = self.query_analyzer.get_retrieval_strategy(analysis)
+
+        # Entity scoring
+        target_entity = analysis.target_entity
+        if target_entity and results and self.entity_scorer:
+            original = list(results)
+            results = self._apply_entity_scoring(results, target_entity, analysis, query)
+            if not results:
+                results = original
+        elif target_entity and results:
+            original = list(results)
+            results = self._filter_by_entity(results, target_entity)
+            if not results:
+                results = original
+
+        # Negation check
+        if strategy.get("check_negations") and analysis.is_negation_check:
+            results = self._verify_negations(results, analysis)
+
+        # Cross-encoder reranker
+        if self.reranker and self.config.use_reranker and results:
+            results = self._apply_reranker(query, results)
+
+        # LLM reranker or heuristic
+        if self.llm_client and self.config.use_llm_reranker and results:
+            results = self._llm_rerank(query, results, analysis)
+        else:
+            results = self._rank_results(results, analysis, strategy)
+
+        # Attention filter — use relaxed threshold for list-type answers
+        # so exhaustive enumeration queries retain more diverse items
+        pre_filter_count = len(results)
+        if self.attention_filter and self.config.use_attention_filter:
+            if analysis.expected_answer_type == "list":
+                orig_threshold = self.attention_filter.config.relevance_threshold
+                self.attention_filter.config.relevance_threshold = min(orig_threshold, 0.15)
+                results = self.attention_filter.filter_context(query, results, query_analysis=analysis)
+                self.attention_filter.config.relevance_threshold = orig_threshold
+            else:
+                results = self.attention_filter.filter_context(query, results, query_analysis=analysis)
+
+        # Compose context
+        composed_context = self._compose_context(results, analysis)
+
+        return RetrievalResponse(
+            query=query,
+            query_analysis=analysis,
+            results=results[: self.config.top_k],
+            composed_context=composed_context,
+            strategy_used=strategy,
+            metadata={
+                "total_candidates": pre_filter_count,
+                "filtered_candidates": len(results),
+                "reasoning_type": analysis.reasoning_type.value,
+                "intent": analysis.intent.value,
+            },
+        )
+
     def _agentic_retrieve(
         self,
         query: str,
@@ -365,6 +625,7 @@ class Retriever:
         Multi-step retrieval that checks if context is sufficient
         and rewrites queries when needed.
         """
+        # --- Original path (always runs as primary) ---
         all_results: list[RetrievalResult] = []
         queries_tried: list[str] = [query]
         round_metadata: list[dict[str, Any]] = []
@@ -438,10 +699,46 @@ class Retriever:
                 }
             )
 
+        # --- Query planner fallback ---
+        # If baseline retrieval is still insufficient after all rewrite rounds,
+        # try the LLM-driven planner for different retrieval strategies.
+        # This only triggers for genuinely hard queries — adversarial questions
+        # with correct "None" answers have high sufficiency (rich context found)
+        # and won't trigger this path.
+        planner_used = False
+        if (
+            self._query_planner
+            and sufficiency < self.config.sufficiency_threshold
+        ):
+            planner_results = self._planner_fallback_retrieve(
+                query, response.query_analysis,
+            )
+            if planner_results:
+                seen_ids = {r.id for r in all_results}
+                new_count = 0
+                for r in planner_results:
+                    if r.id not in seen_ids:
+                        all_results.append(r)
+                        seen_ids.add(r.id)
+                        new_count += 1
+                if new_count > 0:
+                    planner_used = True
+                    logger.info(
+                        "Planner fallback added %d new results (total: %d)",
+                        new_count, len(all_results),
+                    )
+
         # Final ranking of merged results from all rounds.
-        # Each round's results were already scored (LLM reranker or heuristic)
-        # inside _single_pass_retrieve(), so just sort by score.
-        all_results.sort(key=lambda r: r.score, reverse=True)
+        # When planner added new results, re-run LLM reranker on the full
+        # merged set so all candidates get a fair holistic relevance score.
+        # Without this, planner results (which bypass _single_pass_retrieve's
+        # reranker) would compete on raw strategy scores alone.
+        if planner_used and self.llm_client and self.config.use_llm_reranker:
+            all_results = self._llm_rerank(
+                query, all_results, response.query_analysis,
+            )
+        else:
+            all_results.sort(key=lambda r: r.score, reverse=True)
         final_results = all_results[: self.config.top_k]
 
         composed_context = self._compose_context(final_results, response.query_analysis)
@@ -461,8 +758,35 @@ class Retriever:
                 "queries_tried": queries_tried,
                 "round_details": round_metadata,
                 "final_sufficiency": sufficiency,
+                "planner_fallback": planner_used,
             },
         )
+
+    def _planner_fallback_retrieve(
+        self,
+        query: str,
+        analysis: QueryAnalysis,
+    ) -> list[RetrievalResult]:
+        """Run the query planner as a fallback when baseline retrieval is insufficient.
+
+        Returns raw results from the planner (unprocessed — caller merges them
+        with baseline results before post-processing).
+        """
+        try:
+            query_embedding = self._embedding_fn(query) if self._embedding_fn else None
+            raw_results, planner_meta = self._query_planner.plan_and_execute(
+                query, query_embedding, analysis,
+            )
+            logger.info(
+                "Planner fallback: %d results, sufficient=%s, rounds=%d",
+                len(raw_results),
+                planner_meta.get("sufficient"),
+                planner_meta.get("rounds_used", 1),
+            )
+            return raw_results
+        except Exception:
+            logger.exception("Planner fallback failed")
+            return []
 
     def _check_sufficiency(self, query: str, response: RetrievalResponse) -> float:
         """
@@ -513,6 +837,7 @@ class Retriever:
         if not scores:
             return 0.5  # Default
         heuristic_score = sum(scores) / len(scores)
+
 
         # LLM validation — always check when heuristic says sufficient,
         # because heuristic can be overly optimistic (e.g., "that book you
@@ -611,7 +936,10 @@ class Retriever:
 
         # 2. Entity-based search
         if strategy.get("use_entity_search") and analysis.entities:
-            strategy_results["entity"] = self._entity_search(analysis.entities)
+            top_k = 25 if analysis.expected_answer_type == "list" else 5
+            strategy_results["entity"] = self._entity_search(
+                analysis.entities, top_k_per_entity=top_k,
+            )
 
         # 3. Temporal search
         if strategy.get("use_temporal_search"):
@@ -1246,8 +1574,22 @@ class Retriever:
         candidates.sort(key=lambda r: r.score, reverse=True)
         return candidates[:10]
 
-    def _entity_search(self, entities: list[str]) -> list[RetrievalResult]:
-        """Search by entity mentions."""
+    def _entity_search(
+        self,
+        entities: list[str],
+        *,
+        top_k_per_entity: int = 5,
+        source_filter: str | None = None,
+    ) -> list[RetrievalResult]:
+        """Search by entity mentions.
+
+        Args:
+            entities: Entity names to look up.
+            top_k_per_entity: Max memories per entity (default 5).
+            source_filter: If set, only return memories whose source OR
+                metadata category matches (e.g. "cross_person_trait",
+                "personality_trait", "llm_chunk_fact").
+        """
         results = []
 
         for entity_name in entities:
@@ -1258,7 +1600,15 @@ class Retriever:
                 # Get memories involving this entity
                 memories = self.memory.graph.query_by_entity(entity.id)
 
-                for memory in memories[:5]:  # Limit per entity
+                # Apply source filter if specified (matches source OR metadata category)
+                if source_filter:
+                    memories = [
+                        m for m in memories
+                        if m.source == source_filter
+                        or (hasattr(m, "metadata") and m.metadata.get("category") == source_filter)
+                    ]
+
+                for memory in memories[:top_k_per_entity]:
                     results.append(
                         RetrievalResult(
                             id=memory.id,
@@ -2220,8 +2570,18 @@ If none are relevant, return: NONE"""
 
     def _format_result_content(self, result: RetrievalResult) -> str:
         """Format retrieval result with optional speaker/time metadata."""
+        # For proposition-sourced results, use the focused sentence rather
+        # than the full parent message.  The proposition matched the query
+        # semantically; the surrounding message is about a different topic
+        # and would dilute the signal (e.g. "2 younger kids" buried in a
+        # camping narrative).
+        prop_content = result.metadata.get("proposition_content")
+        if prop_content and result.source == "proposition":
+            raw = prop_content
+        else:
+            raw = result.content
         content = (
-            result.content.replace("[NEGATION DETECTED]", "")
+            raw.replace("[NEGATION DETECTED]", "")
             .replace("[STATED AS FALSE]", "")
             .strip()
         )
@@ -2284,7 +2644,10 @@ If none are relevant, return: NONE"""
                 query_embedding, strategy.get("top_k", 30)
             )
         if strategy.get("use_entity_search") and analysis.entities:
-            strategy_results["entity"] = self._entity_search(analysis.entities)
+            top_k = 25 if analysis.expected_answer_type == "list" else 5
+            strategy_results["entity"] = self._entity_search(
+                analysis.entities, top_k_per_entity=top_k,
+            )
         if strategy.get("use_temporal_search"):
             strategy_results["temporal"] = self._temporal_search(analysis)
         if strategy.get("use_graph_traversal"):

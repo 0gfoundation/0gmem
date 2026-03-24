@@ -47,7 +47,7 @@ class EmbeddingCacheConfig:
     """Configuration for embedding cache."""
 
     cache_dir: str = ".cache/embeddings"
-    max_memory_entries: int = 10000
+    max_memory_entries: int = 50000
     persist_to_disk: bool = True
     batch_size: int = 100  # Max texts per API call
     model: str = DEFAULT_EMBEDDING_MODEL

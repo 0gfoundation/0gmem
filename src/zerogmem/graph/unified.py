@@ -147,6 +147,14 @@ class UnifiedMemoryGraph:
                 self._entity_to_memories[entity_id] = set()
             self._entity_to_memories[entity_id].add(memory.id)
 
+        # Also index by entity_names when entities list is empty
+        # (cross_person_trait and llm_chunk_fact memories may only have entity_names)
+        if not memory.entities and memory.entity_names:
+            for name in memory.entity_names:
+                if name not in self._entity_to_memories:
+                    self._entity_to_memories[name] = set()
+                self._entity_to_memories[name].add(memory.id)
+
         for concept in memory.concepts:
             if concept not in self._concept_to_memories:
                 self._concept_to_memories[concept] = set()
@@ -284,8 +292,22 @@ class UnifiedMemoryGraph:
     def query_by_entity(
         self, entity_id: str, relation_filter: list[str] | None = None
     ) -> list[UnifiedMemoryItem]:
-        """Query memories involving an entity."""
+        """Query memories involving an entity.
+
+        Handles both entity node UUIDs and entity name strings as keys,
+        since _entity_to_memories is keyed by normalized entity names.
+        """
         memory_ids = self._entity_to_memories.get(entity_id, set())
+        if not memory_ids:
+            # entity_id might be a UUID — resolve to entity name for lookup
+            memory_ids = self._entity_to_memories.get(entity_id.lower(), set())
+        if not memory_ids:
+            # Try looking up the entity node to get its name
+            node = self.entity_graph.get_node(entity_id)
+            if node:
+                memory_ids = self._entity_to_memories.get(node.name, set())
+                if not memory_ids:
+                    memory_ids = self._entity_to_memories.get(node.name.lower(), set())
         return [self.memories[mid] for mid in memory_ids if mid in self.memories]
 
     def query_by_concept(self, concept: str) -> list[UnifiedMemoryItem]:
@@ -652,6 +674,13 @@ class UnifiedMemoryGraph:
                 if entity_id not in graph._entity_to_memories:
                     graph._entity_to_memories[entity_id] = set()
                 graph._entity_to_memories[entity_id].add(memory.id)
+
+            # Also index by entity_names when entities list is empty
+            if not memory.entities and memory.entity_names:
+                for name in memory.entity_names:
+                    if name not in graph._entity_to_memories:
+                        graph._entity_to_memories[name] = set()
+                    graph._entity_to_memories[name].add(memory.id)
 
             for concept in memory.concepts:
                 if concept not in graph._concept_to_memories:

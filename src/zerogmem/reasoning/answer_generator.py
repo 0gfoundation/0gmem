@@ -222,7 +222,7 @@ class AnswerNormalizer:
         # Conclusion patterns
         if len(answer) > 100:
             for pattern in [
-                r"(?:therefore|thus|so|hence|in conclusion|overall)[,:]?\s*(.+?)(?:\.|$)",
+                r"(?:therefore|thus|\bso\b|hence|in conclusion|overall)[,:]?\s*(.+?)(?:\.|$)",
                 r"(?:the answer is|answer:)\s*(.+?)(?:\.|$)",
                 r"^(?:yes|no)[,.]?\s*(.+?)(?:\.|$)",
             ]:
@@ -354,6 +354,7 @@ class AnswerGenerator:
         category: str | None = None,
         target_entity: str | None = None,
         question_type: QuestionType | None = None,
+        supplementary_instructions: str = "",
     ) -> tuple[str, dict[str, Any]]:
         """
         Generate an answer for a question given context.
@@ -364,6 +365,7 @@ class AnswerGenerator:
             category: Optional category hint for prompt selection
             target_entity: Entity the question is about
             question_type: Pre-classified type (auto-detected if None)
+            supplementary_instructions: Extra instructions for the LLM
 
         Returns:
             (answer, metadata) where metadata includes question_type, evasive, etc.
@@ -379,6 +381,7 @@ class AnswerGenerator:
             question_type=question_type,
             category=category,
             target_entity=target_entity,
+            supplementary_instructions=supplementary_instructions,
         )
 
         metadata: dict[str, Any] = {

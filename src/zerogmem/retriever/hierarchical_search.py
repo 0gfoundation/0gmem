@@ -284,9 +284,14 @@ class HierarchicalIndex:
         session_summary = " | ".join(
             self.chunks[cid].summary for cid in chunk_ids if self.chunks[cid].summary
         )
+        # Limit session summary to ~7000 tokens (~28000 chars) before embedding
+        # to stay within embedding model context limits. Keep the full text for
+        # display but only embed a trimmed version.
         session_embedding = None
-        if self._embed_fn and session_summary:
-            session_embedding = self._embed_fn(session_summary)
+        max_embed_chars = 28000
+        embed_text = session_summary[:max_embed_chars] if len(session_summary) > max_embed_chars else session_summary
+        if self._embed_fn and embed_text:
+            session_embedding = self._embed_fn(embed_text)
 
         self.sessions[session_id] = SessionIndex(
             session_id=session_id,

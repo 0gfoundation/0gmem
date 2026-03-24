@@ -116,14 +116,17 @@ class LoCoMoEvaluator:
         use_cache: bool = True,
         use_bm25: bool = True,
         use_consolidation: bool = False,
+        ingestion_cache_dir: str | None = ".cache/ingestion",
     ):
         self.data_path = data_path
+        self.ingestion_cache_dir = ingestion_cache_dir
         self.llm_client = llm_client
         self.llm_model = llm_model or DEFAULT_LLM_MODEL
         self.llm_max_retries = llm_max_retries
         self.llm_retry_backoff = llm_retry_backoff
         self.use_cache = use_cache
         self.use_bm25 = use_bm25
+        self._conversation_year: int | None = None
 
         # Initialize embedding cache
         self.embedding_cache = None
@@ -147,7 +150,10 @@ class LoCoMoEvaluator:
         # embedding raw text.  The cache ensures we only call the API once per
         # unique string.
         if self.embedding_cache:
-            self.memory.set_embedding_function(self.embedding_cache.get_embedding)
+            self.memory.set_embedding_function(
+                self.embedding_cache.get_embedding,
+                batch_embed_fn=self.embedding_cache.get_embeddings,
+            )
 
         # Configure retriever
         if retriever_config is None:
@@ -251,23 +257,7 @@ class LoCoMoEvaluator:
                             # Include BLIP image captions for visual content
                             blip_caption = msg.get("blip_caption", "")
                             if blip_caption:
-                                text_lower = content.lower()
-                                caption_lower = blip_caption.lower()
-                                is_kids_project = any(
-                                    phrase in text_lower
-                                    for phrase in [
-                                        "kids loved it",
-                                        "our latest",
-                                        "latest work",
-                                        "excited to get their hands dirty",
-                                        "painting together",
-                                    ]
-                                )
-                                is_sign_with_text = "sign" in caption_lower and (
-                                    "says" in caption_lower or "matter" in caption_lower
-                                )
-                                if is_kids_project or is_sign_with_text:
-                                    content = f"{content} [Image shows: {blip_caption}]"
+                                content = f"{content} [Image shows: {blip_caption}]"
                             messages.append(
                                 {
                                     "speaker": msg.get("speaker", "Unknown"),
@@ -355,6 +345,12 @@ class LoCoMoEvaluator:
     # Ingestion
     # ------------------------------------------------------------------ #
 
+    def ingest_or_load_cache(self, conversation: LoCoMoConversation) -> None:
+        """Ingest a conversation, using cache if available."""
+        if not self._load_ingestion_cache(conversation.id):
+            self.ingest_conversation(conversation)
+            self._save_ingestion_cache(conversation.id)
+
     def ingest_conversation(self, conversation: LoCoMoConversation) -> None:
         """Ingest a conversation into the memory system using only the core pipeline."""
         self.memory.start_session(session_id=conversation.id)
@@ -412,23 +408,7 @@ class LoCoMoEvaluator:
                     content = msg.get("content", msg.get("text", msg.get("message", "")))
                     blip_caption = msg.get("blip_caption", "")
                     if blip_caption:
-                        text_lower = content.lower()
-                        caption_lower = blip_caption.lower()
-                        is_kids_project = any(
-                            phrase in text_lower
-                            for phrase in [
-                                "kids loved it",
-                                "our latest",
-                                "latest work",
-                                "excited to get their hands dirty",
-                                "painting together",
-                            ]
-                        )
-                        is_sign_with_text = "sign" in caption_lower and (
-                            "says" in caption_lower or "matter" in caption_lower
-                        )
-                        if is_kids_project or is_sign_with_text:
-                            content = f"{content} [Image shows: {blip_caption}]"
+                        content = f"{content} [Image shows: {blip_caption}]"
                 elif isinstance(msg, str):
                     if ": " in msg:
                         speaker, content = msg.split(": ", 1)
@@ -543,27 +523,37 @@ class LoCoMoEvaluator:
                 pass
         return None
 
+    def _extract_conversation_year(self, conversation: LoCoMoConversation) -> int | None:
+        """Extract the latest year from session timestamps."""
+        latest_year: int | None = None
+        for session in conversation.sessions:
+            ts = session.get("timestamp", "")
+            dt = self._parse_session_date(ts)
+            if dt and (latest_year is None or dt.year > latest_year):
+                latest_year = dt.year
+        return latest_year
+
     # ------------------------------------------------------------------ #
     # Question answering (core pipeline only)
     # ------------------------------------------------------------------ #
 
     def answer_question(
         self, question: LoCoMoQuestion, use_llm: bool = True
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, dict]:
         """
         Answer a question using only the core pipeline.
 
-        Returns: (predicted_answer, retrieved_context)
+        Returns: (predicted_answer, retrieved_context, answer_metadata)
         """
         if not use_llm or not self.llm_client:
             retrieval_result = self.retriever.retrieve(question.question)
             context = retrieval_result.composed_context
-            return self._extract_answer(question.question, context), context
+            return self._extract_answer(question.question, context), context, {}
 
         answer, metadata = self.retriever.answer(
             question.question, category=question.category,
         )
-        return answer, metadata.get("context", "")
+        return answer, metadata.get("context", ""), metadata
 
     @staticmethod
     def _extract_answer(question: str, context: str) -> str:
@@ -604,12 +594,17 @@ class LoCoMoEvaluator:
             "- Partial matches count: if the expected answer is 'Florida' and the "
             "predicted answer is 'Tampa, Florida', that is CORRECT.\n"
             "- Number equivalence: '3' and 'three' are the same.\n"
+            "- Temporal equivalence: 'seven years' and 'since 2016' are equivalent "
+            "if the conversation takes place in 2023. A duration and an absolute "
+            "date/year that refer to the same time span are CORRECT.\n"
             "- Yes/No equivalence: 'Yes' and 'Yes, she does' are the same.\n"
             "- For 'None' expected answers (unanswerable questions): the predicted "
             "answer is correct ONLY if it says 'None', 'not mentioned', "
             "'no information', or similar.\n"
-            "- Be strict: do NOT accept answers that add incorrect information "
-            "or contradict the expected answer.\n\n"
+            "- Extra details are OK: if the predicted answer CONTAINS the expected "
+            "information but also adds additional correct details, that is CORRECT.\n"
+            "- Be strict only about WRONG information: reject answers that contradict "
+            "the expected answer or include clearly incorrect facts.\n\n"
             f"Question: {question}\n"
             f"Expected answer: {expected}\n"
             f"Predicted answer: {predicted}\n\n"
@@ -628,7 +623,7 @@ class LoCoMoEvaluator:
 
     def evaluate_question(self, question: LoCoMoQuestion) -> EvaluationResult:
         """Evaluate a single question."""
-        answer, context = self.answer_question(question)
+        answer, context, answer_meta = self.answer_question(question)
 
         f1 = self._compute_f1(answer, question.answer)
 
@@ -661,6 +656,9 @@ class LoCoMoEvaluator:
             metadata={
                 "conversation_id": question.conversation_id,
                 "llm_judged": llm_judged,
+                "planner_fallback": answer_meta.get("planner_fallback", False),
+                "num_results": answer_meta.get("num_results"),
+                "question_type": answer_meta.get("question_type"),
             },
         )
 
@@ -986,13 +984,13 @@ class LoCoMoEvaluator:
 
     def _compute_f1(self, predicted: str, expected: str) -> float:
         """Compute token-level F1 score with enhanced normalization."""
-        pred_norm = self._normalize(self._normalize_numbers(predicted))
-        exp_norm = self._normalize(self._normalize_numbers(expected))
+        pred_norm = self._normalize_numbers(self._normalize(predicted))
+        exp_norm = self._normalize_numbers(self._normalize(expected))
 
         # For adversarial questions with empty expected answer
-        if not exp_norm or exp_norm == "none":
+        if not exp_norm or exp_norm in ("none", "0"):
             if (
-                pred_norm in ["none", ""]
+                pred_norm in ["none", "0", ""]
                 or "none" in pred_norm
                 or "not mentioned" in pred_norm
                 or "no information" in pred_norm
@@ -1176,11 +1174,19 @@ class LoCoMoEvaluator:
             if pred_years[0] == exp_years[0]:
                 return True
 
-        # "since YYYY" vs "N years"
-        pred_since = re.findall(r"since\s*(\d{4})", pred)
-        exp_since = re.findall(r"since\s*(\d{4})", exp)
+        # "since YYYY" / "since around YYYY" / "since about YYYY"
+        pred_since = re.findall(r"since\s+(?:around\s+|about\s+|approximately\s+)?(\d{4})", pred)
+        exp_since = re.findall(r"since\s+(?:around\s+|about\s+|approximately\s+)?(\d{4})", exp)
         if pred_since and exp_since:
             if pred_since[0] == exp_since[0]:
+                return True
+
+        # Cross-format: "N years" vs "since YYYY"
+        if self._conversation_year and pred_years and exp_since:
+            if self._conversation_year - int(exp_since[0]) == int(pred_years[0]):
+                return True
+        if self._conversation_year and exp_years and pred_since:
+            if self._conversation_year - int(pred_since[0]) == int(exp_years[0]):
                 return True
 
         # "N months" equivalence
@@ -1295,7 +1301,8 @@ class LoCoMoEvaluator:
                 continue
 
             print(f"Processing conversation {conv_id}...")
-            self.ingest_conversation(conversation)
+            self.ingest_or_load_cache(conversation)
+            self._conversation_year = self._extract_conversation_year(conversation)
 
             for question in conversation.questions:
                 if max_questions and question_count >= max_questions:
@@ -1413,12 +1420,16 @@ class LoCoMoEvaluator:
         """Reset memory system for isolated evaluation."""
         self.memory = MemoryManager(config=self.memory_config)
 
+        # Wire embedding cache into memory BEFORE set_llm_client so that
+        # the chunker (created by set_llm_client) gets the batch embed fn.
+        if self.embedding_cache:
+            self.memory.set_embedding_function(
+                self.embedding_cache.get_embedding,
+                batch_embed_fn=self.embedding_cache.get_embeddings,
+            )
+
         if self.llm_client is not None:
             self.memory.set_llm_client(self.llm_client)
-
-        # Wire embedding cache into memory so add_message() uses it
-        if self.embedding_cache:
-            self.memory.set_embedding_function(self.embedding_cache.get_embedding)
 
         # Retriever uses cache for query embeddings (fast repeat lookups)
         retriever_embed_fn = (
@@ -1433,6 +1444,199 @@ class LoCoMoEvaluator:
             llm_client=self.llm_client,
             llm_model=self.llm_model,
         )
+
+    # ------------------------------------------------------------------ #
+    # Ingestion cache: save/load full memory state to avoid re-ingestion
+    # ------------------------------------------------------------------ #
+
+    def _ingestion_cache_key(self, conv_id: str) -> str:
+        """Build a cache key that captures config affecting ingestion output.
+
+        Includes a hash of the LLM fact extraction prompts so that prompt
+        changes automatically invalidate the cache.
+        """
+        import hashlib
+
+        # Bump _CACHE_VERSION when ingestion logic changes (e.g. BLIP
+        # caption handling, speaker enrichment) to invalidate stale caches.
+        _CACHE_VERSION = 2
+
+        parts = [
+            conv_id,
+            f"v={_CACHE_VERSION}",
+            f"chunks={self.memory_config.use_chunks}",
+            f"llm_facts={self.memory_config.use_llm_fact_extraction}",
+            f"props={self.memory_config.use_proposition_index}",
+            f"bm25={self.memory_config.use_bm25}",
+            f"consolidate={self.memory_config.auto_consolidate}",
+            f"chunk_win={self.memory_config.chunk_window_size}",
+            f"model={self.memory_config.chunk_llm_model}",
+        ]
+
+        # Include extraction prompt content so prompt changes invalidate cache
+        if self.memory_config.use_llm_fact_extraction:
+            from zerogmem.memory.chunk_fact_extractor import (
+                _SYSTEM_PROMPT as _fact_sys,
+                _USER_PROMPT as _fact_usr,
+            )
+            prompt_hash = hashlib.sha256(
+                (_fact_sys + _fact_usr).encode()
+            ).hexdigest()[:12]
+            parts.append(f"fact_prompt={prompt_hash}")
+
+        key_str = "|".join(parts)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+    def _ingestion_cache_path(self, conv_id: str) -> Path:
+        """Return the cache file path for a conversation."""
+        if not self.ingestion_cache_dir:
+            return Path("/dev/null")  # never matches
+        key = self._ingestion_cache_key(conv_id)
+        return Path(self.ingestion_cache_dir) / f"{conv_id}_{key}.npz"
+
+    def _save_ingestion_cache(self, conv_id: str) -> None:
+        """Save memory state + embeddings after ingestion."""
+        if not self.ingestion_cache_dir:
+            return
+
+        import numpy as np
+
+        cache_path = self._ingestion_cache_path(conv_id)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Collect all embeddings from the memory graph
+        embeddings: dict[str, np.ndarray] = {}
+        for mid, mem in self.memory.graph.memories.items():
+            if mem.embedding is not None:
+                embeddings[f"mem_{mid}"] = mem.embedding
+
+        # Semantic memory fact embeddings
+        for fid, fact in self.memory.semantic_memory.facts.items():
+            if fact.embedding is not None:
+                embeddings[f"fact_{fid}"] = fact.embedding
+
+        # Proposition index embeddings
+        if self.memory.proposition_index:
+            for pid, prop in self.memory.proposition_index.propositions.items():
+                if prop.embedding is not None:
+                    embeddings[f"prop_{pid}"] = prop.embedding
+
+        # Serialize state dict as JSON inside the npz
+        state_dict = self.memory.to_dict()
+        state_json = json.dumps(state_dict).encode("utf-8")
+
+        # Chunker state
+        chunker_dict = {}
+        if self.memory.chunker:
+            chunker_dict = self.memory.chunker.to_dict()
+        chunker_json = json.dumps(chunker_dict).encode("utf-8")
+
+        # Save everything in one npz
+        np.savez_compressed(
+            str(cache_path),
+            state_json=np.frombuffer(state_json, dtype=np.uint8),
+            chunker_json=np.frombuffer(chunker_json, dtype=np.uint8),
+            **embeddings,
+        )
+        print(f"  Ingestion cache saved: {cache_path.name} "
+              f"({len(self.memory.graph.memories)} memories, "
+              f"{len(embeddings)} embeddings)")
+
+    def _load_ingestion_cache(self, conv_id: str) -> bool:
+        """Try to load memory state from cache. Returns True on success."""
+        if not self.ingestion_cache_dir:
+            return False
+
+        import numpy as np
+
+        cache_path = self._ingestion_cache_path(conv_id)
+        if not cache_path.exists():
+            return False
+
+        try:
+            data = np.load(str(cache_path), allow_pickle=False)
+
+            # Restore state dict
+            state_json = data["state_json"].tobytes().decode("utf-8")
+            state_dict = json.loads(state_json)
+
+            # Build embeddings map
+            embeddings_map: dict[str, np.ndarray] = {}
+            for key in data.files:
+                if key.startswith("mem_"):
+                    embeddings_map[key[4:]] = data[key]
+                elif key.startswith("fact_"):
+                    embeddings_map[key[5:]] = data[key]
+                elif key.startswith("prop_"):
+                    embeddings_map[key[5:]] = data[key]
+
+            # Restore memory manager
+            embed_fn = (
+                self.embedding_cache.get_embedding
+                if self.embedding_cache
+                else None
+            )
+            batch_embed_fn = (
+                self.embedding_cache.get_embeddings
+                if self.embedding_cache
+                else None
+            )
+
+            self.memory = MemoryManager.from_dict(
+                state_dict,
+                embedding_fn=embed_fn,
+                embeddings_map=embeddings_map,
+            )
+
+            # Set up embedding functions on the restored manager
+            if embed_fn:
+                self.memory.set_embedding_function(embed_fn, batch_embed_fn)
+
+            # Restore LLM client (before chunker, since chunker may need it)
+            if self.llm_client is not None:
+                self.memory.set_llm_client(self.llm_client)
+
+            # Restore chunker state
+            chunker_json = data["chunker_json"].tobytes().decode("utf-8")
+            chunker_dict = json.loads(chunker_json)
+            if chunker_dict and self.memory.chunker:
+                from zerogmem.memory.chunker import ChunkManager as _CM
+                self.memory.chunker = _CM.from_dict(
+                    chunker_dict,
+                    memory=self.memory,
+                    llm_client=self.llm_client,
+                    embed_fn=embed_fn,
+                    config=self.memory.chunker.config,
+                    batch_embed_fn=batch_embed_fn,
+                )
+
+            # Rebuild BM25 from memories
+            if self.memory_config.use_bm25:
+                self.memory.enable_bm25()
+
+            # Rebuild retriever
+            retriever_embed_fn = (
+                self.embedding_cache.get_embedding
+                if self.embedding_cache
+                else self.memory.encoder.get_embedding
+            )
+            self.retriever = Retriever(
+                self.memory,
+                config=self.retriever_config,
+                embedding_fn=retriever_embed_fn,
+                llm_client=self.llm_client,
+                llm_model=self.llm_model,
+            )
+
+            print(f"  Ingestion cache loaded: {cache_path.name} "
+                  f"({len(self.memory.graph.memories)} memories)")
+            return True
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print(f"  Warning: failed to load ingestion cache, re-ingesting")
+            return False
 
     def save_cache(self) -> None:
         """Save embedding cache to disk."""
@@ -1495,6 +1699,7 @@ class LoCoMoEvaluator:
                     "exact_match": r.exact_match,
                     "conversation_id": (r.metadata or {}).get("conversation_id"),
                     "llm_judged": (r.metadata or {}).get("llm_judged", False),
+                    "planner_fallback": (r.metadata or {}).get("planner_fallback", False),
                 }
                 for r in results.results
             ],

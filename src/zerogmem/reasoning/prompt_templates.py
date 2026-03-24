@@ -190,7 +190,9 @@ class PromptTemplates:
 
         # Adversarial gets its own specialized prompt
         if question_type == QuestionType.ADVERSARIAL:
-            return self._adversarial_prompt(query, context, target_entity)
+            return self._adversarial_prompt(
+                query, context, target_entity, supplementary_instructions
+            )
 
         # Strip vague temporal modifiers for non-temporal question types.
         # The retriever already used them; they only confuse the answer LLM.
@@ -222,12 +224,12 @@ Answer:"""
             return """ANSWER FORMAT:
 - This is a DURATION question asking about time periods
 - Look for phrases like "since 2016", "for 4 years", "been doing X for Y years"
-- Answer formats:
-  * "Since 2016" (if they say "since 2016" or "started in 2016")
-  * "4 years" (if they say "for 4 years" or "been 4 years")
-  * "10 years ago" (if they say "10 years ago")
-- For "how long has X been doing Y": look for "since [year]" or "[N] years"
-- DO NOT convert to dates - keep the duration/period format"""
+- PREFERRED: Convert relative durations to absolute years using the message date:
+  * "Seven years now" said on 13 September 2023 → "Since 2016" (2023 - 7 = 2016)
+  * "Started 3 years ago" said on 20 July 2023 → "Since 2020"
+- If no message date is available, keep the original format:
+  * "4 years" / "10 years ago" / "since 2016"
+- For "how long has X been doing Y": compute "Since [year]" when possible"""
 
         if question_type == QuestionType.TEMPORAL_DATE:
             return """ANSWER FORMAT:
@@ -242,12 +244,21 @@ EVENT IDENTIFICATION (CRITICAL):
 - When someone says "we just did it yesterday" in a conversation about nature/outdoors, and the question asks about a hike, this IS the hike
 - DO NOT require the exact word from the question to appear — use inference
 
+MULTIPLE EVENTS:
+- If the context contains MULTIPLE distinct occurrences of the same event
+  that ALL satisfy the question's constraints (e.g., time range, location),
+  list ALL matching dates separated by semicolons, earliest first.
+- Only include events that match the question — e.g., if the question asks
+  "during the summer", only include events that occurred in summer months.
+- Example: "The week before 3 July 2023; The Friday before 14 August 2023"
+
 OUTPUT EXAMPLES (follow these exactly):
 - "7 May 2023"
 - "The week before 27 June 2023"
 - "The Friday before 14 August 2023"
 - "June 2023"
 - "2022"
+- "The week before 3 July 2023; The Friday before 14 August 2023"
 
 CRITICAL — ALWAYS CONVERT TO ABSOLUTE DATES:
 You MUST convert ALL relative expressions to absolute dates using the session date.
@@ -278,18 +289,25 @@ NEVER return full sentences — ONLY the absolute date/time expression!"""
 - Return ONLY a NUMBER (digit or word): "1", "2", "3", "once", "twice", "three"
 
 COUNTING METHOD:
-1. First look for EXPLICIT counts: "three turtles", "twice", "my two dogs"
+1. For "how many times" questions:
+   - Count DISTINCT DATED EVENTS from the context (different dates = different events)
+   - IGNORE general frequency/habit statements like "once or twice a year",
+     "usually every month", "a few times" — these describe habits, NOT actual counts
+   - Example: messages on July 6 and July 20 both mention beach = 2 beach visits
 
-2. If no explicit count, INFER from distinct individuals or events:
-   - "my son had an accident... they explained their brother would be OK"
-     -> "they" (≥2 kids) + "their brother" (1 more) = at least 3 children
-   - "my daughter's birthday" + "my son" + other siblings = count them
+2. For "how many [things]" questions:
+   - First look for EXPLICIT counts: "three turtles", "twice", "my two dogs"
+   - If no explicit count, INFER from comparative/relative language:
+     * "2 younger kids" → "younger" IMPLIES at least 1 older child exists → at least 3 children total
+     * "youngest child" → implies at least 2 children
+     * "older son" + "2 younger kids" → 1 older + 2 younger = 3 children
+     * "my son had an accident... they explained their brother would be OK"
+       → "they" (≥2 kids) + "their brother" (1 more) = at least 3 children
+   - CRITICAL: Words like "younger", "oldest", "older" are COMPARATIVE — they prove
+     the existence of OTHER members not explicitly named. Always count the implied ones.
    - Names mentioned as children/pets/items = count distinct ones
 
-3. For "how many times" questions:
-   - Count UNIQUE events, not mentions of the same event
-
-4. Do NOT count word occurrences — count stated or inferable quantities
+3. Do NOT count word occurrences — count stated or inferable quantities
 
 RETURN JUST THE NUMBER - no explanation!"""
 
@@ -315,13 +333,25 @@ IMPORTANT: DO NOT explain your reasoning steps. ONLY give the final answer.
 
 For YES/NO inference questions:
 - Start with "Yes" or "No" or "Likely yes" or "Likely no"
-- Add ONE brief reason (max 10 words)
+- If the context has CONTRADICTORY evidence (both for and against), use a
+  NUANCED answer: "Somewhat", "Partially", "To some extent, but not entirely"
+  Example: pro-religion evidence (faith necklace, made art for church) AND
+  anti-religion evidence (upset by religious conservatives) → "Somewhat, but
+  not extremely religious"
+- Otherwise, add ONE brief reason (max 10 words)
 - Example: "Yes, since she collects classic children's books"
-- Example: "Likely no; since this one went badly"
+- Example: "Somewhat; she values faith but clashed with religious conservatives"
 
-For TRAIT/ATTRIBUTE questions:
-- List 2-4 key traits/attributes as comma-separated words
-- Example: "Thoughtful, authentic, driven"
+For TRAIT/ATTRIBUTE/LIST questions ("what traits/hobbies/qualities does X have"):
+- Scan the ENTIRE context — both explicit labels AND descriptive passages
+- Extract traits from DESCRIPTIONS too: "praised for her drive" → driven,
+  "admires her courage" → courageous, "following her dreams" → driven/ambitious,
+  "finding her true self" → authentic, "dedication" → dedicated/driven
+- List ALL distinct traits found — do NOT cap at a small number
+- Prefer specific, distinctive traits (e.g., "thoughtful", "authentic", "driven")
+  over generic compliments (e.g., "strong", "inspiring", "amazing")
+- Return as comma-separated words
+- Example: "Thoughtful, authentic, driven, courageous, dedicated"
 
 INFERENCE CHAIN METHOD - Follow this reasoning:
 1. FIND: What facts are stated about the person?
@@ -398,7 +428,8 @@ IMPORTANT - ANSWER FORMAT:
 - For ALL questions: extract the answer or say "None" - no explanations"""
 
     def _adversarial_prompt(
-        self, query: str, context: str, target_entity: str | None
+        self, query: str, context: str, target_entity: str | None,
+        supplementary_instructions: str = "",
     ) -> str:
         """Build a specialized prompt for adversarial questions."""
         entity_name = target_entity or "target entity"
@@ -418,6 +449,8 @@ IMPORTANT - ANSWER FORMAT:
             )
             answer_line = 'Answer (just the fact or "None"):'
 
+        extra = f"\n{supplementary_instructions}\n" if supplementary_instructions else ""
+
         return f"""Based on the following context, answer the question about {entity_name}.
 
 WARNING: This may be a TRICK QUESTION that swaps names. The context may contain
@@ -427,8 +460,8 @@ STRICT RULES:
 1. ONLY use first-person statements FROM {entity_name} (look for [{entity_name}]: prefix)
 2. {entity_name} must say "I", "my", "mine" about the topic — not someone else saying it about them
 3. If a DIFFERENT speaker (not {entity_name}) mentions the item/topic -> that does NOT count
-4. If {entity_name} never personally claims or mentions the topic -> answer "None"
-
+4. If {entity_name} never personally claims or mentions the topic -> answer "No" for yes/no questions, "None" otherwise
+{extra}
 Context:
 {context}
 
@@ -437,6 +470,16 @@ Question: {query}
 VERIFICATION:
 1. What specific item/attribute/action is the question asking about?
 2. Scan ONLY [{entity_name}]: lines — does {entity_name} PERSONALLY mention this?
+3. Does the context match the EXACT relationship asked about?
+   - "fan of modern music" ≠ "finds a song inspiring"
+   - "reason for getting into X" ≠ "mentioning X in passing"
+   - "setback" = something that interrupted progress/activity (injury, failure, loss)
+     ≠ a bad social encounter or unpleasant experience
+   - If the context only shows a LOOSELY RELATED fact, answer "None"
+4. Does {entity_name} use the SPECIFIC TERM or a clear synonym from the question?
+   - If the question asks about a "setback" but {entity_name} only describes
+     a "bad experience" or "tough time" without it blocking/interrupting something,
+     that is NOT a match — answer "None"
 {answer_guidance}
 
 {answer_line}"""

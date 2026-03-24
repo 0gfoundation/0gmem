@@ -443,6 +443,15 @@ Return ONLY valid JSON, no markdown fences or extra text."""
         ):
             reasoning_type = ReasoningType.TEMPORAL
 
+        # Override answer type: keyword-based list detection is more reliable
+        # than LLM for trait/attribute/multi-item questions
+        expected_answer_type = llm.expected_answer_type
+        keyword_answer_type = self._determine_answer_type(
+            llm.original_query.lower(), llm.intent
+        )
+        if keyword_answer_type == "list":
+            expected_answer_type = "list"
+
         return QueryAnalysis(
             original_query=llm.original_query,
             intent=llm.intent,
@@ -453,7 +462,7 @@ Return ONLY valid JSON, no markdown fences or extra text."""
             keywords=merged_keywords,
             target_entity=llm.target_entity,
             is_negation_check=llm.is_negation_check or regex.is_negation_check,
-            expected_answer_type=llm.expected_answer_type,
+            expected_answer_type=expected_answer_type,
             confidence=llm.confidence,
             metadata=llm.metadata,
         )
@@ -746,6 +755,13 @@ Return ONLY valid JSON, no markdown fences or extra text."""
 
         # List questions
         if intent == QueryIntent.LIST:
+            return "list"
+
+        # Trait/attribute/multi-item questions are implicitly list queries
+        if re.search(
+            r"\bwhat\s+(?:\w+\s+)*(traits|hobbies|qualities|attributes|interests|books|activities|events|things|symbols|pets)\b",
+            query_lower,
+        ):
             return "list"
 
         return "text"

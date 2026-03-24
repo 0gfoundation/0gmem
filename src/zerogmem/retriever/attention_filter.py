@@ -168,10 +168,18 @@ class AttentionFilter:
                     continue
 
                 # Check similarity with kept embeddings
+                # Short texts (e.g. "X has trait: Y") embed very similarly
+                # even when carrying distinct info — use stricter threshold
+                content_len = len(sc)
+                if content_len < 120:
+                    effective_threshold = min(0.95, self.config.semantic_similarity_threshold + 0.10)
+                else:
+                    effective_threshold = self.config.semantic_similarity_threshold
+
                 is_duplicate = False
                 for kept_emb in kept_embeddings:
                     similarity = self._cosine_similarity(emb, kept_emb)
-                    if similarity > self.config.semantic_similarity_threshold:
+                    if similarity > effective_threshold:
                         is_duplicate = True
                         break
 

@@ -47,6 +47,7 @@ class ChunkConfig:
     max_retries: int = 2
     temperature: float = 0.1
     max_completion_tokens: int = 16000   # Token budget for segmentation response
+    use_llm_fact_extraction: bool = False  # Per-chunk LLM fact extraction
 
 
 # ---------------------------------------------------------------------------
@@ -138,16 +139,34 @@ class ChunkManager:
         llm_client: Any | None = None,
         embed_fn: Callable[[str], np.ndarray] | None = None,
         config: ChunkConfig | None = None,
+        batch_embed_fn: Callable[[list[str]], list[np.ndarray]] | None = None,
     ) -> None:
         self.memory = memory
         self.llm_client = llm_client
         self._embed_fn = embed_fn
+        self._batch_embed_fn = batch_embed_fn
         self.config = config or ChunkConfig()
 
         # Accumulated message IDs since last segmentation
         self._message_buffer: list[str] = []
         # All chunks created, keyed by chunk ID
         self._chunks: dict[str, Chunk] = {}
+
+        # Per-chunk LLM fact extraction
+        self._fact_extractor: Any | None = None
+        if config and config.use_llm_fact_extraction and llm_client:
+            from zerogmem.memory.chunk_fact_extractor import (
+                ChunkFactExtractor,
+                ChunkFactExtractorConfig,
+            )
+
+            self._fact_extractor = ChunkFactExtractor(
+                llm_client=llm_client,
+                config=ChunkFactExtractorConfig(
+                    enabled=True,
+                    llm_model=config.llm_model,
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -631,6 +650,110 @@ class ChunkManager:
                 except Exception:
                     logger.debug("Failed to add causal link", exc_info=True)
 
+        # Per-chunk LLM fact extraction
+        if self._fact_extractor:
+            self._extract_and_store_chunk_facts(chunk, memory_item)
+
+    def _extract_and_store_chunk_facts(
+        self, chunk: Chunk, parent_item: Any
+    ) -> None:
+        """Run LLM fact extraction on a chunk and store results."""
+        from zerogmem.graph.unified import UnifiedMemoryItem
+
+        messages = self._gather_messages(chunk.message_ids)
+        if not messages:
+            return
+
+        # Determine participants
+        participants: list[str] = [
+            e["name"] for e in chunk.entities
+            if e.get("name") and e.get("type", "").lower() in ("person", "unknown", "")
+        ]
+        if not participants:
+            participants = sorted({m["speaker"] for m in messages if m.get("speaker")})
+        if not participants:
+            return
+
+        facts = self._fact_extractor.extract_facts(messages, participants)
+        if not facts:
+            return
+
+        # Batch-embed all facts at once for efficiency
+        texts_to_embed: list[str] = []
+        for fact in facts:
+            fact_content = f"{fact.subject} {fact.predicate} {fact.object}"
+            if self.config.enrich_embedding_prefix:
+                texts_to_embed.append(
+                    self.enrich_content_for_embedding(
+                        fact_content, fact.speaker, chunk.session_id,
+                    )
+                )
+            else:
+                texts_to_embed.append(fact_content)
+
+        embeddings: list[Any] = [None] * len(facts)
+        if texts_to_embed:
+            if self._batch_embed_fn:
+                embeddings = self._batch_embed_fn(texts_to_embed)
+            elif self._embed_fn:
+                embeddings = [self._embed_fn(t) for t in texts_to_embed]
+
+        for fact, embedding in zip(facts, embeddings):
+            fact_content = f"{fact.subject} {fact.predicate} {fact.object}"
+
+            # Collect entity names from subject/object
+            entity_names: list[str] = []
+            for name in (fact.subject, fact.object):
+                if name and name[0].isupper() and name.lower() not in (
+                    "none", "unknown", "yes", "no", "true", "false",
+                ):
+                    entity_names.append(name)
+
+            fact_item = UnifiedMemoryItem(
+                content=fact_content,
+                embedding=embedding,
+                entities=list(entity_names),
+                entity_names=entity_names,
+                source="llm_chunk_fact",
+                session_id=chunk.session_id,
+                speaker=fact.speaker,
+                metadata={
+                    "fact_type": fact.fact_type,
+                    "category": fact.category,
+                    "negated": fact.negated,
+                    "parent_chunk_id": chunk.id,
+                },
+            )
+
+            self.memory.graph.add_memory(fact_item)
+
+            # Add to BM25
+            if self.memory.bm25 is not None:
+                self.memory.bm25.add_document(
+                    doc_id=fact_item.id,
+                    content=f"{fact.speaker}: {fact_content}",
+                    metadata={
+                        "speaker": fact.speaker,
+                        "session_id": chunk.session_id,
+                    },
+                )
+
+            # Also store as semantic SPO triple
+            try:
+                self.memory.add_fact(
+                    subject=fact.subject,
+                    predicate=fact.predicate,
+                    obj=fact.object,
+                    category=fact.category,
+                    negated=fact.negated,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to add extracted fact %s %s %s",
+                    fact.subject, fact.predicate, fact.object,
+                    exc_info=True,
+                )
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -671,9 +794,10 @@ class ChunkManager:
         llm_client: Any | None = None,
         embed_fn: Any | None = None,
         config: ChunkConfig | None = None,
+        batch_embed_fn: Callable[[list[str]], list[np.ndarray]] | None = None,
     ) -> ChunkManager:
         """Restore chunk manager from serialized state."""
-        manager = cls(memory=memory, llm_client=llm_client, embed_fn=embed_fn, config=config)
+        manager = cls(memory=memory, llm_client=llm_client, embed_fn=embed_fn, config=config, batch_embed_fn=batch_embed_fn)
         manager._message_buffer = data.get("message_buffer", [])
 
         for chunk_data in data.get("chunks", []):

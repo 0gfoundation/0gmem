@@ -110,9 +110,19 @@ def main():
         help="Enable LLM-based memory consolidation during ingestion"
     )
     parser.add_argument(
+        "--use-llm-facts",
+        action="store_true",
+        help="Enable per-chunk LLM fact extraction during ingestion"
+    )
+    parser.add_argument(
         "--use-retrieval-reasoning",
         action="store_true",
         help="Enable LLM-based retrieval-time reasoning for weak results"
+    )
+    parser.add_argument(
+        "--use-query-planner",
+        action="store_true",
+        help="Enable LLM-driven query planner (replaces hardcoded strategy selection)"
     )
     parser.add_argument(
         "--use-reranker",
@@ -170,6 +180,7 @@ def main():
         working_memory_capacity=30,
         embedding_dim=3072,
         auto_consolidate=args.use_consolidation,
+        use_llm_fact_extraction=args.use_llm_facts,
     )
 
     encoder_config = EncoderConfig(
@@ -179,14 +190,19 @@ def main():
 
     # Use locomo.py's tuned default RetrieverConfig unless overrides needed
     retriever_config = None
-    if args.use_reranker or args.use_retrieval_reasoning:
+    if args.use_reranker or args.use_retrieval_reasoning or args.use_query_planner:
+        # Start from defaults so we don't accidentally disable features
+        # (e.g., use_reranker defaults to True but --use-reranker is store_true)
         retriever_config = RetrieverConfig(
-            use_reranker=args.use_reranker,
-            rerank_top_n=args.rerank_top_n,
-            rerank_weight=args.rerank_weight,
-            reranker_model=args.reranker_model,
             use_retrieval_reasoning=args.use_retrieval_reasoning,
+            use_query_planner=args.use_query_planner,
         )
+        # Only override reranker settings if explicitly requested
+        if args.use_reranker:
+            retriever_config.use_reranker = True
+            retriever_config.rerank_top_n = args.rerank_top_n
+            retriever_config.rerank_weight = args.rerank_weight
+            retriever_config.reranker_model = args.reranker_model
 
     # Initialize evaluator with new features
     print("\nInitializing 0GMem evaluator...")

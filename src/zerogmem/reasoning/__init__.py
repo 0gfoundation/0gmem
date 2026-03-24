@@ -6,7 +6,6 @@ This module contains:
 - Question Decomposition: Break complex questions into sub-questions
 - Answer Generation: LLM-based answer generation with normalization
 - Prompt Templates: Question-type-aware prompt construction
-- Counting Pipeline: Specialized counting question answering
 """
 
 from zerogmem.reasoning.answer_generator import (
@@ -20,11 +19,6 @@ from zerogmem.reasoning.answer_verifier import (
     AnswerVerifier,
     ConsistencyChecker,
     VerificationResult,
-)
-from zerogmem.reasoning.counting import (
-    CountingConfig,
-    CountingEvidence,
-    CountingPipeline,
 )
 from zerogmem.reasoning.prompt_templates import (
     PromptTemplates,
@@ -56,8 +50,4 @@ __all__ = [
     "PromptTemplates",
     "QuestionType",
     "QuestionTypeClassifier",
-    # Counting
-    "CountingPipeline",
-    "CountingConfig",
-    "CountingEvidence",
 ]
